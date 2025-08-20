@@ -4,6 +4,9 @@ const Tiktok = require("@tobyg74/tiktok-api-dl");
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const cluster = require('cluster');
+const os = require('os');
 
 // Bot Token from environment variable
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -14,25 +17,171 @@ if (!BOT_TOKEN) {
     process.exit(1);
 }
 
-// Initialize Bot
-const bot = new Bot(BOT_TOKEN);
+// Advanced Configuration
+const ADVANCED_CONFIG = {
+    maxConcurrentUsers: 50, // Maximum concurrent users
+    maxConcurrentDownloads: 20, // Maximum concurrent downloads per user
+    maxConcurrentUploads: 10, // Maximum concurrent uploads per user
+    downloadTimeout: 60000, // 60 seconds timeout per download
+    uploadTimeout: 120000, // 2 minutes timeout per upload
+    maxRetries: 3,
+    useWorkerThreads: false, // Set to true for worker threads (experimental)
+    connectionPoolSize: 50, // HTTP connection pool size
+    memoryThreshold: 1024 * 1024 * 1024, // 1GB memory threshold
+    cleanupInterval: 30000, // 30 seconds cleanup interval
+};
+
+// Resource Management
+class ResourceManager {
+    constructor() {
+        this.activeUsers = new Map();
+        this.downloadSemaphore = new Semaphore(ADVANCED_CONFIG.maxConcurrentDownloads);
+        this.uploadSemaphore = new Semaphore(ADVANCED_CONFIG.maxConcurrentUploads);
+        this.userSemaphore = new Semaphore(ADVANCED_CONFIG.maxConcurrentUsers);
+        this.httpAgent = new (require('https').Agent)({
+            keepAlive: true,
+            maxSockets: ADVANCED_CONFIG.connectionPoolSize,
+            maxFreeSockets: 10,
+            timeout: 30000,
+            freeSocketTimeout: 4000,
+        });
+        
+        // Start cleanup interval
+        this.startCleanupInterval();
+    }
+    
+    async acquireUserSlot(userId) {
+        await this.userSemaphore.acquire();
+        this.activeUsers.set(userId, Date.now());
+    }
+    
+    releaseUserSlot(userId) {
+        this.activeUsers.delete(userId);
+        this.userSemaphore.release();
+    }
+    
+    async acquireDownloadSlot() {
+        await this.downloadSemaphore.acquire();
+    }
+    
+    releaseDownloadSlot() {
+        this.downloadSemaphore.release();
+    }
+    
+    async acquireUploadSlot() {
+        await this.uploadSemaphore.acquire();
+    }
+    
+    releaseUploadSlot() {
+        this.uploadSemaphore.release();
+    }
+    
+    getHttpAgent() {
+        return this.httpAgent;
+    }
+    
+    getActiveUsersCount() {
+        return this.activeUsers.size;
+    }
+    
+    startCleanupInterval() {
+        setInterval(() => {
+            this.cleanupResources();
+        }, ADVANCED_CONFIG.cleanupInterval);
+    }
+    
+    cleanupResources() {
+        const now = Date.now();
+        const timeout = 5 * 60 * 1000; // 5 minutes timeout
+        
+        for (const [userId, timestamp] of this.activeUsers.entries()) {
+            if (now - timestamp > timeout) {
+                log(`Cleaning up stale user session: ${userId}`, 'INFO', 'yellow');
+                this.releaseUserSlot(userId);
+            }
+        }
+        
+        // Memory cleanup
+        if (process.memoryUsage().heapUsed > ADVANCED_CONFIG.memoryThreshold) {
+            log('Memory threshold exceeded, forcing garbage collection', 'WARN', 'yellow');
+            if (global.gc) {
+                global.gc();
+            }
+        }
+    }
+}
+
+// Semaphore implementation for concurrency control
+class Semaphore {
+    constructor(permits) {
+        this.permits = permits;
+        this.waiters = [];
+    }
+    
+    async acquire() {
+        return new Promise((resolve) => {
+            if (this.permits > 0) {
+                this.permits--;
+                resolve();
+            } else {
+                this.waiters.push(resolve);
+            }
+        });
+    }
+    
+    release() {
+        this.permits++;
+        if (this.waiters.length > 0) {
+            const waiter = this.waiters.shift();
+            this.permits--;
+            waiter();
+        }
+    }
+}
+
+// Initialize Resource Manager
+const resourceManager = new ResourceManager();
+
+// Initialize Bot with concurrency optimization
+const bot = new Bot(BOT_TOKEN, {
+    // Enable concurrent message processing
+    botInfo: undefined, // Will be set during start
+    // Remove default rate limiting
+    client: {
+        timeoutSeconds: 60,
+        retryCount: 3,
+        environment: "prod"
+    }
+});
+
+// Enable concurrent processing by removing sequential middleware
+bot.use(async (ctx, next) => {
+    // Process each message in parallel without waiting
+    setImmediate(async () => {
+        try {
+            await next();
+        } catch (error) {
+            logError(error, `Middleware error for user ${ctx.from?.id}`);
+        }
+    });
+});
 
 // Cookie management
 let cookieString = null;
 
 // Auto-delete configuration
 const AUTO_DELETE_CONFIG = {
-    enabled: true, // Set to false to disable auto-delete
-    deleteDelay: 2000, // Delay in milliseconds before deleting original message (2 seconds)
-    onlyInGroups: true, // Only delete in groups, not in private chats
-    deleteStatusMessages: true // Also delete processing status messages
+    enabled: true,
+    deleteDelay: 2000,
+    onlyInGroups: true,
+    deleteStatusMessages: true
 };
 
 // API version configuration
 const API_CONFIG = {
-    retryWithV2OnV1Failure: true, // Enable v2 fallback
-    v1MaxRetries: 1, // Max retries for v1 before switching to v2
-    v2MaxRetries: 2  // Max retries for v2
+    retryWithV2OnV1Failure: true,
+    v1MaxRetries: 1,
+    v2MaxRetries: 2
 };
 
 // Logging colors
@@ -46,18 +195,20 @@ const colors = {
     reset: '\x1b[0m'
 };
 
-// Enhanced logging function
-function log(message, level = 'INFO', color = 'reset') {
+// Enhanced logging function with user tracking
+function log(message, level = 'INFO', color = 'reset', userId = null) {
     const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] [${level}] ${message}`;
+    const userInfo = userId ? ` [User:${userId}]` : '';
+    const activeUsers = resourceManager.getActiveUsersCount();
+    const logMessage = `[${timestamp}] [${level}]${userInfo} [Active:${activeUsers}] ${message}`;
     console.log(colors[color] + logMessage + colors.reset);
 }
 
 // Error monitoring function
-function logError(error, context = '') {
-    log(`ERROR in ${context}: ${error.message}`, 'ERROR', 'red');
-    if (error.stack) {
-        log(`Stack trace: ${error.stack}`, 'ERROR', 'red');
+function logError(error, context = '', userId = null) {
+    log(`ERROR in ${context}: ${error.message}`, 'ERROR', 'red', userId);
+    if (error.stack && process.env.NODE_ENV === 'development') {
+        log(`Stack trace: ${error.stack}`, 'ERROR', 'red', userId);
     }
 }
 
@@ -72,7 +223,7 @@ async function canDeleteMessages(ctx) {
         const chatMember = await ctx.api.getChatMember(ctx.chat.id, ctx.me.id);
         return chatMember.can_delete_messages || chatMember.status === 'administrator' || chatMember.status === 'creator';
     } catch (error) {
-        log(`Cannot check delete permissions: ${error.message}`, 'WARN', 'yellow');
+        log(`Cannot check delete permissions: ${error.message}`, 'WARN', 'yellow', ctx.from?.id);
         return false;
     }
 }
@@ -84,18 +235,16 @@ async function safeDeleteMessage(ctx, messageId = null, delay = 0) {
     const targetMessageId = messageId || ctx.message.message_id;
     
     try {
-        // Add delay if specified
         if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));
         }
         
         await ctx.api.deleteMessage(ctx.chat.id, targetMessageId);
-        log(`Deleted message ${targetMessageId} in chat ${ctx.chat.id}`, 'INFO', 'blue');
+        log(`Deleted message ${targetMessageId} in chat ${ctx.chat.id}`, 'INFO', 'blue', ctx.from?.id);
         return true;
     } catch (error) {
-        // Don't log error for common cases like message already deleted
         if (!error.message.includes('message to delete not found')) {
-            log(`Failed to delete message ${targetMessageId}: ${error.message}`, 'WARN', 'yellow');
+            log(`Failed to delete message ${targetMessageId}: ${error.message}`, 'WARN', 'yellow', ctx.from?.id);
         }
         return false;
     }
@@ -122,11 +271,14 @@ function loadCookies() {
     }
 }
 
-// Get axios config with or without cookies
+// Get axios config with connection pooling and optimization
 function getAxiosConfig(useCookies = false) {
     const config = {
-        timeout: 30000, // 30 seconds timeout
+        timeout: ADVANCED_CONFIG.downloadTimeout,
         maxRedirects: 10,
+        httpsAgent: resourceManager.getHttpAgent(),
+        maxContentLength: 500 * 1024 * 1024, // 500MB max file size
+        maxBodyLength: 500 * 1024 * 1024,
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': '*/*',
@@ -140,7 +292,6 @@ function getAxiosConfig(useCookies = false) {
         }
     };
     
-    // Add cookies if available and requested
     if (useCookies && cookieString) {
         config.headers['Cookie'] = cookieString;
         log('🍪 Using cookies for request', 'INFO', 'cyan');
@@ -149,152 +300,189 @@ function getAxiosConfig(useCookies = false) {
     return config;
 }
 
-// Enhanced TikTok data fetching with v1/v2 fallback
-async function fetchTikTokData(url) {
+// Enhanced TikTok data fetching with concurrent API calls
+async function fetchTikTokData(url, userId) {
     let lastError = null;
     
-    // Try v1 API first
+    // Create promises for both API versions to run concurrently
+    const apiPromises = [];
+    
+    // Add v1 API promise
     if (API_CONFIG.v1MaxRetries > 0) {
-        for (let attempt = 1; attempt <= API_CONFIG.v1MaxRetries; attempt++) {
-            try {
-                log(`Attempting v1 API (attempt ${attempt}/${API_CONFIG.v1MaxRetries}): ${url}`, 'INFO', 'blue');
-                
-                const result = await Tiktok.Downloader(url, { version: "v1" });
-                
-                if (result && result.status === "success" && result.result) {
-                    log('✅ v1 API successful', 'INFO', 'green');
-                    return { ...result, apiVersion: 'v1' };
-                } else {
-                    throw new Error(result?.message || "v1 API returned unsuccessful status");
+        apiPromises.push(
+            (async () => {
+                for (let attempt = 1; attempt <= API_CONFIG.v1MaxRetries; attempt++) {
+                    try {
+                        log(`Attempting v1 API (attempt ${attempt}/${API_CONFIG.v1MaxRetries}): ${url}`, 'INFO', 'blue', userId);
+                        
+                        const result = await Tiktok.Downloader(url, { version: "v1" });
+                        
+                        if (result && result.status === "success" && result.result) {
+                            log('✅ v1 API successful', 'INFO', 'green', userId);
+                            return { ...result, apiVersion: 'v1' };
+                        } else {
+                            throw new Error(result?.message || "v1 API returned unsuccessful status");
+                        }
+                        
+                    } catch (error) {
+                        lastError = error;
+                        log(`v1 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
+                        
+                        if (attempt < API_CONFIG.v1MaxRetries) {
+                            const delay = Math.min(Math.pow(2, attempt) * 1000, 5000); // Max 5s delay
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                        }
+                    }
                 }
-                
-            } catch (error) {
-                lastError = error;
-                log(`v1 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow');
-                
-                if (attempt < API_CONFIG.v1MaxRetries) {
-                    const delay = Math.pow(2, attempt) * 1000;
-                    log(`Retrying v1 in ${delay}ms...`, 'INFO', 'yellow');
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-        }
+                throw lastError;
+            })()
+        );
     }
     
-    // Try v2 API as fallback
+    // Add v2 API promise if fallback is enabled
     if (API_CONFIG.retryWithV2OnV1Failure && API_CONFIG.v2MaxRetries > 0) {
-        log('🔄 v1 API failed, trying v2 API as fallback...', 'INFO', 'cyan');
-        
-        for (let attempt = 1; attempt <= API_CONFIG.v2MaxRetries; attempt++) {
-            try {
-                log(`Attempting v2 API (attempt ${attempt}/${API_CONFIG.v2MaxRetries}): ${url}`, 'INFO', 'blue');
+        apiPromises.push(
+            (async () => {
+                // Wait a bit before trying v2 to give v1 a chance
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 
-                const result = await Tiktok.Downloader(url, { version: "v2" });
-                
-                if (result && result.status === "success" && result.result) {
-                    log('✅ v2 API successful', 'INFO', 'green');
-                    return { ...result, apiVersion: 'v2' };
-                } else {
-                    throw new Error(result?.message || "v2 API returned unsuccessful status");
+                for (let attempt = 1; attempt <= API_CONFIG.v2MaxRetries; attempt++) {
+                    try {
+                        log(`Attempting v2 API (attempt ${attempt}/${API_CONFIG.v2MaxRetries}): ${url}`, 'INFO', 'blue', userId);
+                        
+                        const result = await Tiktok.Downloader(url, { version: "v2" });
+                        
+                        if (result && result.status === "success" && result.result) {
+                            log('✅ v2 API successful', 'INFO', 'green', userId);
+                            return { ...result, apiVersion: 'v2' };
+                        } else {
+                            throw new Error(result?.message || "v2 API returned unsuccessful status");
+                        }
+                        
+                    } catch (error) {
+                        lastError = error;
+                        log(`v2 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
+                        
+                        if (attempt < API_CONFIG.v2MaxRetries) {
+                            const delay = Math.min(Math.pow(2, attempt) * 1000, 5000);
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                        }
+                    }
                 }
-                
-            } catch (error) {
-                lastError = error;
-                log(`v2 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow');
-                
-                if (attempt < API_CONFIG.v2MaxRetries) {
-                    const delay = Math.pow(2, attempt) * 1000;
-                    log(`Retrying v2 in ${delay}ms...`, 'INFO', 'yellow');
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-        }
+                throw lastError;
+            })()
+        );
     }
     
-    // Both APIs failed
-    throw new Error(`Both v1 and v2 APIs failed. Last error: ${lastError?.message || 'Unknown error'}`);
+    // Race the API calls - return first successful result
+    try {
+        const result = await Promise.any(apiPromises);
+        return result;
+    } catch (error) {
+        // All APIs failed
+        throw new Error(`Both v1 and v2 APIs failed. Last error: ${lastError?.message || 'Unknown error'}`);
+    }
 }
 
-// Enhanced download function with DIRECT STREAMING support
-async function downloadFile(url, filename = null, retries = 3, useCookies = false, streamMode = false) {
-    let lastError = null;
+// Enhanced download function with semaphore and streaming optimization
+async function downloadFile(url, filename, userId, retries = 3, useCookies = false) {
+    await resourceManager.acquireDownloadSlot();
     
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            log(`${streamMode ? 'Streaming' : 'Download'} attempt ${attempt}/${retries} for: ${streamMode ? 'direct stream' : path.basename(filename)} ${useCookies ? '(with cookies)' : ''}`, 'INFO', 'blue');
-            
-            const config = getAxiosConfig(useCookies);
-            const response = await axios({
-                ...config,
-                method: 'GET',
-                url: url,
-                responseType: 'stream'
-            });
-            
-            // STREAMING MODE - Return stream directly without saving to disk
-            if (streamMode) {
-                const contentLength = response.headers['content-length'];
-                const sizeMB = contentLength ? (parseInt(contentLength) / 1024 / 1024).toFixed(2) : 'Unknown';
+    try {
+        let lastError = null;
+        
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                log(`Download attempt ${attempt}/${retries} for: ${path.basename(filename)} ${useCookies ? '(with cookies)' : ''}`, 'INFO', 'blue', userId);
                 
-                log(`Stream ready: ${sizeMB} MB`, 'INFO', 'green');
-                
-                return {
-                    stream: response.data,
-                    size: contentLength ? parseInt(contentLength) : 0,
-                    sizeMB: sizeMB,
-                    contentType: response.headers['content-type'] || 'application/octet-stream'
-                };
-            }
-            
-            // TRADITIONAL MODE - Save to file (fallback for images)
-            const writer = fs.createWriteStream(filename);
-            response.data.pipe(writer);
-            
-            return new Promise((resolve, reject) => {
-                writer.on('finish', () => {
-                    const stats = fs.statSync(filename);
-                    const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
-                    log(`File downloaded successfully: ${path.basename(filename)} (${sizeMB} MB)`, 'INFO', 'green');
-                    resolve({ filename, size: stats.size, sizeMB });
+                const config = getAxiosConfig(useCookies);
+                const response = await axios({
+                    ...config,
+                    method: 'GET',
+                    url: url,
+                    responseType: 'stream'
                 });
                 
-                writer.on('error', (err) => {
+                // Create write stream with optimized buffer
+                const writer = fs.createWriteStream(filename, { 
+                    highWaterMark: 64 * 1024 // 64KB buffer
+                });
+                
+                // Stream with progress tracking
+                let downloadedBytes = 0;
+                const totalBytes = parseInt(response.headers['content-length']) || 0;
+                
+                response.data.on('data', (chunk) => {
+                    downloadedBytes += chunk.length;
+                    if (totalBytes > 0) {
+                        const progress = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+                        if (downloadedBytes % (1024 * 1024) === 0) { // Log every MB
+                            log(`Download progress: ${progress}% (${Math.round(downloadedBytes / 1024 / 1024)}MB)`, 'INFO', 'cyan', userId);
+                        }
+                    }
+                });
+                
+                response.data.pipe(writer);
+                
+                return new Promise((resolve, reject) => {
+                    writer.on('finish', () => {
+                        const stats = fs.statSync(filename);
+                        const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
+                        log(`File downloaded successfully: ${path.basename(filename)} (${sizeMB} MB)`, 'INFO', 'green', userId);
+                        resolve({ filename, size: stats.size, sizeMB });
+                    });
+                    
+                    writer.on('error', (err) => {
+                        fs.unlink(filename, () => {});
+                        reject(err);
+                    });
+                    
+                    response.data.on('error', (err) => {
+                        writer.destroy();
+                        fs.unlink(filename, () => {});
+                        reject(err);
+                    });
+                    
+                    // Timeout handling
+                    const timeoutId = setTimeout(() => {
+                        writer.destroy();
+                        fs.unlink(filename, () => {});
+                        reject(new Error('Download timeout'));
+                    }, ADVANCED_CONFIG.downloadTimeout);
+                    
+                    writer.on('finish', () => clearTimeout(timeoutId));
+                    writer.on('error', () => clearTimeout(timeoutId));
+                });
+                
+            } catch (error) {
+                lastError = error;
+                log(`Download attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
+                
+                // Clean up failed download
+                if (fs.existsSync(filename)) {
                     fs.unlink(filename, () => {});
-                    reject(err);
-                });
+                }
                 
-                response.data.on('error', (err) => {
-                    writer.destroy();
-                    fs.unlink(filename, () => {});
-                    reject(err);
-                });
-            });
-            
-        } catch (error) {
-            lastError = error;
-            log(`${streamMode ? 'Streaming' : 'Download'} attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow');
-            
-            // Clean up failed download (only for file mode)
-            if (!streamMode && filename && fs.existsSync(filename)) {
-                fs.unlink(filename, () => {});
-            }
-            
-            // If first attempt failed without cookies, try with cookies on next attempt
-            if (attempt === 1 && !useCookies && cookieString && (error.response?.status === 403 || error.code === 'ECONNREFUSED')) {
-                log('🍪 First attempt failed, will try with cookies on next attempt', 'INFO', 'yellow');
-                useCookies = true;
-            }
-            
-            if (attempt < retries) {
-                // Wait before retry (exponential backoff)
-                const delay = Math.pow(2, attempt) * 1000;
-                log(`Retrying in ${delay}ms...`, 'INFO', 'yellow');
-                await new Promise(resolve => setTimeout(resolve, delay));
+                // Smart retry logic
+                if (attempt === 1 && !useCookies && cookieString && 
+                    (error.response?.status === 403 || error.code === 'ECONNREFUSED')) {
+                    log('🍪 First attempt failed, will try with cookies on next attempt', 'INFO', 'yellow', userId);
+                    useCookies = true;
+                }
+                
+                if (attempt < retries) {
+                    const delay = Math.min(Math.pow(2, attempt) * 1000, 10000); // Max 10s delay
+                    log(`Retrying in ${delay}ms...`, 'INFO', 'yellow', userId);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
             }
         }
+        
+        throw new Error(`Failed to download after ${retries} attempts. Last error: ${lastError?.message || 'Unknown error'}`);
+        
+    } finally {
+        resourceManager.releaseDownloadSlot();
     }
-    
-    throw new Error(`Failed to ${streamMode ? 'stream' : 'download'} after ${retries} attempts. Last error: ${lastError?.message || 'Unknown error'}`);
 }
 
 // Format timestamp to readable date
@@ -316,21 +504,18 @@ function formatTimestamp(timestamp) {
     }
 }
 
-// Get best quality video URL with fallback options (supports both v1 and v2)
+// Get best quality video URL with fallback options
 function getBestVideoUrl(videoData, apiVersion = 'v1') {
     if (!videoData || !videoData.video) return null;
     
     let videoSources = [];
     
     if (apiVersion === 'v2') {
-        // Handle v2 API response format
         if (videoData.video.playAddr && Array.isArray(videoData.video.playAddr)) {
-            // v2 format: playAddr is an array
             videoSources = videoData.video.playAddr;
             log(`v2 API: Found ${videoSources.length} video sources`, 'INFO', 'cyan');
         }
     } else {
-        // Handle v1 API response format
         videoSources = [
             videoData.video.playAddr,
             videoData.video.downloadAddr,
@@ -340,7 +525,6 @@ function getBestVideoUrl(videoData, apiVersion = 'v1') {
         ].filter(Boolean);
     }
     
-    // If playAddr is an array, get the first one
     let bestUrl = videoSources[0];
     if (Array.isArray(bestUrl)) {
         bestUrl = bestUrl[0];
@@ -363,62 +547,58 @@ function extractUrls(text) {
     return urls.filter(url => isValidTikTokUrl(url));
 }
 
-// Generate enhanced caption with hyperlink and description
+// Generate enhanced caption
 function generateCaption(data, isPhoto = false, fileSize = null, apiVersion = 'v1') {
     const createTime = formatTimestamp(data.createTime || data.create_time);
     const uid = data.author?.uid || data.author?.id || 'Unknown';
     const username = data.author?.uniqueId || data.author?.username || data.author?.nickname || 'Unknown';
     const videoId = data.id || data.aweme_id || 'Unknown';
     
-    // Get original TikTok URL
     const originalUrl = data.url || data.webVideoUrl || `https://www.tiktok.com/@${username}/${isPhoto ? 'photo' : 'video'}/${videoId}`;
     
     let caption = `📅 ${createTime}\n`;
     caption += `👤 UID: ${uid}\n`;
-    
-    // Create hyperlink for username
     caption += `👤 Username: [${username}](${originalUrl})\n`;
     
-    // Add file size if provided
     if (fileSize) {
         caption += `📁 Size: ${fileSize} MB\n`;
     }
     
-    // Add API version info
     caption += `🔧 API: ${apiVersion.toUpperCase()}\n`;
-    
     caption += `🔗 [Link TikTok](${originalUrl})`;
     
-    // Add description if available
     const description = data.desc || data.description || '';
     if (description && description.trim()) {
-        const cleanDesc = description.trim().substring(0, 300); // Limit description length
+        const cleanDesc = description.trim().substring(0, 300);
         caption += `\n\n📝 "${cleanDesc}${description.length > 300 ? '...' : ''}"`;
     }
     
     return caption;
 }
 
-// Main TikTok processing function with auto-delete support - NO RATE LIMITING
+// Main TikTok processing function with advanced concurrency
 async function processTikTokUrl(ctx, url) {
     const userId = ctx.from.id;
     const username = ctx.from.username || ctx.from.first_name || 'Unknown';
     const isGroup = isGroupChat(ctx);
     const originalMessageId = ctx.message.message_id;
     
-    log(`Processing TikTok URL from user ${username} (${userId}) in ${isGroup ? 'group' : 'private'}: ${url}`, 'INFO', 'cyan');
-    
-    let statusMessage = null;
-    let canDelete = false;
+    // Acquire user slot for resource management
+    await resourceManager.acquireUserSlot(userId);
     
     try {
+        log(`Processing TikTok URL from user ${username} (${userId}) in ${isGroup ? 'group' : 'private'}: ${url}`, 'INFO', 'cyan', userId);
+        
+        let statusMessage = null;
+        let canDelete = false;
+        
         // Check deletion permissions if in group
         if (isGroup && AUTO_DELETE_CONFIG.enabled) {
             canDelete = await canDeleteMessages(ctx);
             if (canDelete) {
-                log('Bot has permission to delete messages in this group', 'INFO', 'blue');
+                log('Bot has permission to delete messages in this group', 'INFO', 'blue', userId);
             } else {
-                log('Bot cannot delete messages in this group', 'WARN', 'yellow');
+                log('Bot cannot delete messages in this group', 'WARN', 'yellow', userId);
             }
         }
         
@@ -428,14 +608,14 @@ async function processTikTokUrl(ctx, url) {
         // Send initial message
         statusMessage = await ctx.reply("📄 Mengunduh konten TikTok...");
         
-        // Get TikTok data with v1/v2 fallback
-        log(`Fetching TikTok data for: ${url}`, 'INFO', 'blue');
-        const result = await fetchTikTokData(url);
+        // Get TikTok data with concurrent API calls
+        log(`Fetching TikTok data for: ${url}`, 'INFO', 'blue', userId);
+        const result = await fetchTikTokData(url, userId);
         
         const data = result.result;
         const apiVersion = result.apiVersion || 'v1';
         
-        log(`Successfully fetched TikTok data using ${apiVersion.toUpperCase()} API. Type: ${data.type}`, 'INFO', 'green');
+        log(`Successfully fetched TikTok data using ${apiVersion.toUpperCase()} API. Type: ${data.type}`, 'INFO', 'green', userId);
         
         // Update status message
         await ctx.api.editMessageText(
@@ -444,137 +624,149 @@ async function processTikTokUrl(ctx, url) {
             "📥 Memproses konten..."
         );
         
-        // Check content type and process
+        // Process content based on type
         let success = false;
         if (data.type === "image" || (data.images && data.images.length > 0)) {
-            // Handle image slideshow
-            success = await handleImageSlideshow(ctx, data, statusMessage, apiVersion);
+            success = await handleImageSlideshow(ctx, data, statusMessage, apiVersion, userId);
         } else {
-            // Handle video
-            success = await handleVideo(ctx, data, statusMessage, apiVersion);
+            success = await handleVideo(ctx, data, statusMessage, apiVersion, userId);
         }
         
         // Delete status message if configured
         if (AUTO_DELETE_CONFIG.deleteStatusMessages && statusMessage) {
             await safeDeleteMessage(ctx, statusMessage.message_id);
-            statusMessage = null; // Prevent double deletion
+            statusMessage = null;
         }
         
         // Delete original message if successful and in group
         if (success && isGroup && AUTO_DELETE_CONFIG.enabled && 
             (!AUTO_DELETE_CONFIG.onlyInGroups || isGroup) && canDelete) {
             
-            log(`Scheduling deletion of original message ${originalMessageId} in ${AUTO_DELETE_CONFIG.deleteDelay}ms`, 'INFO', 'cyan');
+            log(`Scheduling deletion of original message ${originalMessageId} in ${AUTO_DELETE_CONFIG.deleteDelay}ms`, 'INFO', 'cyan', userId);
             await safeDeleteMessage(ctx, originalMessageId, AUTO_DELETE_CONFIG.deleteDelay);
         }
         
-        log(`Successfully processed TikTok URL for user ${username} using ${apiVersion.toUpperCase()} API`, 'INFO', 'green');
+        log(`Successfully processed TikTok URL for user ${username} using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
         
     } catch (error) {
-        logError(error, 'processTikTokUrl');
+        logError(error, 'processTikTokUrl', userId);
         await ctx.reply(`❌ Gagal mengunduh konten: ${error.message}`);
-        
-        // Still delete status message on error if configured
-        if (AUTO_DELETE_CONFIG.deleteStatusMessages && statusMessage) {
-            await safeDeleteMessage(ctx, statusMessage.message_id, 3000); // Delete after 3s on error
-        }
     } finally {
-        // Cleanup status message if still exists
-        if (statusMessage && AUTO_DELETE_CONFIG.deleteStatusMessages) {
-            await safeDeleteMessage(ctx, statusMessage.message_id);
-        }
+        // Always release user slot
+        resourceManager.releaseUserSlot(userId);
     }
 }
 
-// Handle video content with DIRECT STREAMING - No disk storage required!
-async function handleVideo(ctx, data, statusMessage, apiVersion = 'v1') {
+// Handle video content with upload semaphore
+async function handleVideo(ctx, data, statusMessage, apiVersion = 'v1', userId) {
+    await resourceManager.acquireUploadSlot();
+    
     try {
+        let filename = null;
+        
         const videoUrl = getBestVideoUrl(data, apiVersion);
         if (!videoUrl) {
             throw new Error("No video URL found in response data");
         }
         
-        log(`🚀 STREAMING video directly from ${apiVersion.toUpperCase()} API: ${videoUrl.substring(0, 150)}...`, 'INFO', 'blue');
+        log(`Attempting to download video from ${apiVersion.toUpperCase()} API: ${videoUrl.substring(0, 150)}...`, 'INFO', 'blue', userId);
         
         // Update status
         await ctx.api.editMessageText(
             statusMessage.chat.id,
             statusMessage.message_id,
-            "🌊 Streaming video langsung..."
+            "📱 Mengunduh video..."
         );
         
-        // STREAM MODE - Download video directly to memory without saving to disk
-        const streamResult = await downloadFile(videoUrl, null, 3, false, true);
-        
-        // Verify stream has content
-        if (streamResult.size === 0) {
-            throw new Error("Stream is empty");
+        // Create temporary directory if not exists
+        const tempDir = './temp';
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
         }
         
-        if (streamResult.size < 1024) { // Less than 1KB, probably an error page
-            throw new Error("Stream is too small, likely an error response");
+        // Generate unique filename with user ID
+        const timestamp = Date.now();
+        const randomId = Math.random().toString(36).substring(2, 15);
+        filename = path.join(tempDir, `video_${userId}_${timestamp}_${randomId}.mp4`);
+        
+        // Download video
+        const downloadResult = await downloadFile(videoUrl, filename, userId);
+        
+        // Verify file
+        if (downloadResult.size === 0) {
+            throw new Error("Downloaded file is empty");
         }
         
-        log(`🌊 Video stream ready: ${streamResult.sizeMB} MB - Sending directly to Telegram`, 'INFO', 'green');
+        if (downloadResult.size < 1024) {
+            throw new Error("Downloaded file is too small, likely an error response");
+        }
+        
+        log(`Video downloaded successfully: ${path.basename(filename)} (${downloadResult.sizeMB} MB)`, 'INFO', 'green', userId);
         
         // Update status
         await ctx.api.editMessageText(
             statusMessage.chat.id,
             statusMessage.message_id,
-            "📤 Mengirim video (streaming)..."
+            "📤 Mengirim video..."
         );
         
-        // Generate caption with file size and API version
-        const caption = generateCaption(data, false, streamResult.sizeMB, apiVersion);
+        // Generate caption
+        const caption = generateCaption(data, false, downloadResult.sizeMB, apiVersion);
         
-        // Create InputFile from stream - NO TEMPORARY FILE NEEDED!
-        const inputFile = new InputFile(streamResult.stream, `video_${Date.now()}.mp4`);
+        // Send video with timeout
+        const uploadPromise = ctx.replyWithVideo(new InputFile(filename), {
+            caption: caption,
+            supports_streaming: true,
+            parse_mode: "Markdown"
+        });
         
-        // Send video directly from stream with error handling
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Upload timeout')), ADVANCED_CONFIG.uploadTimeout);
+        });
+        
         try {
-            await ctx.replyWithVideo(inputFile, {
-                caption: caption,
-                supports_streaming: true,
-                parse_mode: "Markdown"
-            });
+            await Promise.race([uploadPromise, timeoutPromise]);
         } catch (sendError) {
-            // Try sending without parse_mode if Markdown fails
-            log(`Failed to send with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow');
+            log(`Failed to send with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow', userId);
             try {
-                // Create new stream since the previous one might be consumed
-                const retryStreamResult = await downloadFile(videoUrl, null, 2, false, true);
-                const retryInputFile = new InputFile(retryStreamResult.stream, `video_${Date.now()}.mp4`);
-                
-                await ctx.replyWithVideo(retryInputFile, {
-                    caption: caption,
-                    supports_streaming: true
-                });
+                await Promise.race([
+                    ctx.replyWithVideo(new InputFile(filename), {
+                        caption: caption,
+                        supports_streaming: true
+                    }),
+                    timeoutPromise
+                ]);
             } catch (sendError2) {
-                // Try sending without caption if that fails too
-                log(`Failed to send with caption, trying without: ${sendError2.message}`, 'WARN', 'yellow');
-                
-                const finalStreamResult = await downloadFile(videoUrl, null, 2, false, true);
-                const finalInputFile = new InputFile(finalStreamResult.stream, `video_${Date.now()}.mp4`);
-                
-                await ctx.replyWithVideo(finalInputFile, {
-                    supports_streaming: true
-                });
-                // Send caption separately
+                log(`Failed to send with caption, trying without: ${sendError2.message}`, 'WARN', 'yellow', userId);
+                await Promise.race([
+                    ctx.replyWithVideo(new InputFile(filename), {
+                        supports_streaming: true
+                    }),
+                    timeoutPromise
+                ]);
                 await ctx.reply(caption, { parse_mode: "Markdown" });
             }
         }
         
-        log(`🚀 Video streamed successfully using ${apiVersion.toUpperCase()} API - NO DISK STORAGE USED!`, 'INFO', 'green');
-        return true; // Success
+        log(`Video sent successfully using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
+        
+        // Cleanup file immediately after successful upload
+        if (filename && fs.existsSync(filename)) {
+            fs.unlink(filename, (err) => {
+                if (err) logError(err, 'cleanup video file', userId);
+                else log(`Cleaned up temporary file: ${path.basename(filename)}`, 'INFO', 'blue', userId);
+            });
+        }
+        
+        return true;
         
     } catch (error) {
-        logError(error, 'handleVideo');
+        logError(error, 'handleVideo', userId);
         
-        // Try to provide more specific error messages
         if (error.code === 'ECONNREFUSED') {
             throw new Error("Koneksi ditolak server TikTok. Coba lagi dalam beberapa menit.");
         } else if (error.code === 'ETIMEDOUT') {
-            throw new Error("Timeout saat streaming video. Video mungkin terlalu besar atau koneksi lambat.");
+            throw new Error("Timeout saat mengunduh video. Video mungkin terlalu besar atau koneksi lambat.");
         } else if (error.message.includes('403')) {
             throw new Error("Akses ke video ditolak. Video mungkin private atau region-blocked.");
         } else if (error.message.includes('404')) {
@@ -582,170 +774,122 @@ async function handleVideo(ctx, data, statusMessage, apiVersion = 'v1') {
         }
         
         throw error;
+    } finally {
+        resourceManager.releaseUploadSlot();
     }
-    // NO CLEANUP NEEDED - No temporary files created! 🎉
 }
 
-// Handle image slideshow with HYBRID STREAMING - Minimal disk usage
-async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1') {
-    const tempFiles = [];
-    const streamResults = [];
+// Handle image slideshow with advanced concurrency
+async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1', userId) {
+    await resourceManager.acquireUploadSlot();
     
     try {
+        const filenames = [];
+        const downloadResults = [];
+        
         const images = data.images || [];
         if (images.length === 0) {
             throw new Error("No images found in slideshow data");
         }
         
-        log(`🌊 Processing ${images.length} images with STREAMING optimization using ${apiVersion.toUpperCase()} API`, 'INFO', 'blue');
+        log(`Processing ${images.length} images from slideshow using ${apiVersion.toUpperCase()} API`, 'INFO', 'blue', userId);
         
         // Update status
         await ctx.api.editMessageText(
             statusMessage.chat.id,
             statusMessage.message_id,
-            `🌊 Streaming ${images.length} gambar...`
+            `📸 Mengunduh ${images.length} gambar...`
         );
         
-        // For images, we use a hybrid approach: stream to temporary buffers, then send
-        // This is because Telegram media groups need file references
-        const timestamp = Date.now();
-        
-        // Process images with OPTIMIZED streaming - parallel processing
-        const imageProcessPromises = images.map(async (imageUrl, index) => {
-            try {
-                log(`🌊 Streaming image ${index + 1}/${images.length}`, 'INFO', 'cyan');
-                
-                // Try streaming mode first
-                try {
-                    const streamResult = await downloadFile(imageUrl, null, 2, false, true);
-                    
-                    // Convert stream to buffer for Telegram compatibility
-                    const chunks = [];
-                    
-                    return new Promise((resolve, reject) => {
-                        streamResult.stream.on('data', chunk => chunks.push(chunk));
-                        streamResult.stream.on('end', () => {
-                            const buffer = Buffer.concat(chunks);
-                            
-                            // Verify image buffer
-                            if (buffer.length < 1024) {
-                                reject(new Error(`Image ${index + 1} buffer too small (${buffer.length} bytes)`));
-                                return;
-                            }
-                            
-                            const sizeMB = (buffer.length / 1024 / 1024).toFixed(2);
-                            log(`🌊 Image ${index + 1} streamed to buffer: ${sizeMB} MB`, 'INFO', 'green');
-                            
-                            resolve({
-                                buffer: buffer,
-                                size: buffer.length,
-                                sizeMB: sizeMB,
-                                index: index,
-                                filename: `image_${timestamp}_${index}.jpg`
-                            });
-                        });
-                        streamResult.stream.on('error', reject);
-                    });
-                    
-                } catch (streamError) {
-                    log(`Stream failed for image ${index + 1}, falling back to temp file: ${streamError.message}`, 'WARN', 'yellow');
-                    
-                    // Fallback to temporary file method
-                    const tempDir = './temp';
-                    if (!fs.existsSync(tempDir)) {
-                        fs.mkdirSync(tempDir, { recursive: true });
-                    }
-                    
-                    const randomId = Math.random().toString(36).substring(2, 8);
-                    const filename = path.join(tempDir, `image_${timestamp}_${index}_${randomId}.jpg`);
-                    
-                    const result = await downloadFile(imageUrl, filename, 2, false, false);
-                    tempFiles.push(filename);
-                    
-                    return {
-                        filename: result.filename,
-                        size: result.size,
-                        sizeMB: result.sizeMB,
-                        index: index,
-                        isFile: true
-                    };
-                }
-                
-            } catch (error) {
-                logError(error, `process image ${index + 1}`);
-                throw new Error(`Failed to process image ${index + 1}: ${error.message}`);
-            }
-        });
-        
-        // Process all images simultaneously - PARALLEL STREAMING
-        const imageResults = await Promise.allSettled(imageProcessPromises);
-        
-        // Separate successful and failed results
-        const successfulImages = [];
-        const failedImages = [];
-        
-        imageResults.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
-                successfulImages.push(result.value);
-                streamResults.push(result.value);
-            } else {
-                failedImages.push({ index: index + 1, error: result.reason.message });
-            }
-        });
-        
-        if (successfulImages.length === 0) {
-            throw new Error("Failed to process any images");
+        // Create temporary directory
+        const tempDir = './temp';
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
         }
         
-        if (failedImages.length > 0) {
-            log(`Warning: ${failedImages.length} images failed to process`, 'WARN', 'yellow');
+        // Download all images concurrently with proper resource management
+        const timestamp = Date.now();
+        const downloadPromises = images.map(async (imageUrl, index) => {
+            try {
+                const randomId = Math.random().toString(36).substring(2, 8);
+                const filename = path.join(tempDir, `image_${userId}_${timestamp}_${index}_${randomId}.jpg`);
+                
+                log(`Downloading image ${index + 1}/${images.length}`, 'INFO', 'cyan', userId);
+                const result = await downloadFile(imageUrl, filename, userId);
+                
+                if (result.size < 1024) {
+                    throw new Error(`Image ${index + 1} is too small (${result.size} bytes)`);
+                }
+                
+                return { filename: result.filename, size: result.size, sizeMB: result.sizeMB };
+            } catch (error) {
+                logError(error, `download image ${index + 1}`, userId);
+                throw new Error(`Failed to download image ${index + 1}: ${error.message}`);
+            }
+        });
+        
+        // Execute downloads with controlled concurrency
+        const downloadSettledResults = await Promise.allSettled(downloadPromises);
+        
+        // Process results
+        const successfulDownloads = [];
+        const failedDownloads = [];
+        
+        downloadSettledResults.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                successfulDownloads.push(result.value);
+                downloadResults.push(result.value);
+                filenames.push(result.value.filename);
+            } else {
+                failedDownloads.push({ index: index + 1, error: result.reason.message });
+            }
+        });
+        
+        if (successfulDownloads.length === 0) {
+            throw new Error("Failed to download any images");
+        }
+        
+        if (failedDownloads.length > 0) {
+            log(`Warning: ${failedDownloads.length} images failed to download`, 'WARN', 'yellow', userId);
         }
         
         // Calculate total size
-        const totalSizeMB = successfulImages.reduce((sum, result) => sum + parseFloat(result.sizeMB), 0).toFixed(2);
+        const totalSizeMB = downloadResults.reduce((sum, result) => sum + parseFloat(result.sizeMB), 0).toFixed(2);
         
-        log(`🌊 Successfully processed ${successfulImages.length}/${images.length} images (${totalSizeMB} MB total) using STREAMING`, 'INFO', 'green');
+        log(`Successfully downloaded ${successfulDownloads.length}/${images.length} images (${totalSizeMB} MB total) using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
         
         // Update status
         await ctx.api.editMessageText(
             statusMessage.chat.id,
             statusMessage.message_id,
-            `📤 Mengirim ${successfulImages.length} gambar (streamed)...`
+            `📤 Mengirim ${successfulDownloads.length} gambar...`
         );
         
         // Generate caption
         const caption = generateCaption(data, true, totalSizeMB, apiVersion);
         
-        // Prepare media group with buffers and files
-        const mediaGroup = successfulImages
-            .sort((a, b) => a.index - b.index)
-            .map((result, index) => ({
-                type: "photo",
-                media: result.buffer ? 
-                    new InputFile(result.buffer, result.filename) : 
-                    new InputFile(result.filename),
-                caption: index === 0 ? caption : undefined
-            }));
-        
-        // Send media groups in chunks (Telegram limit: 10 per group)
+        // Send images in chunks of 10 (Telegram limit) concurrently
         const mediaGroupChunks = [];
-        for (let i = 0; i < mediaGroup.length; i += 10) {
-            mediaGroupChunks.push(mediaGroup.slice(i, i + 10));
+        for (let i = 0; i < successfulDownloads.length; i += 10) {
+            const chunk = successfulDownloads.slice(i, i + 10).map((result, index) => ({
+                type: "photo",
+                media: new InputFile(result.filename),
+                caption: i === 0 && index === 0 ? caption : undefined
+            }));
+            mediaGroupChunks.push(chunk);
         }
         
-        // Send all chunks simultaneously
+        // Send all chunks concurrently
         const sendPromises = mediaGroupChunks.map(async (chunk, chunkIndex) => {
             try {
                 await ctx.replyWithMediaGroup(chunk, { parse_mode: "Markdown" });
-                log(`📤 Media group chunk ${chunkIndex + 1} sent successfully`, 'INFO', 'green');
             } catch (sendError) {
-                log(`Failed to send media group chunk ${chunkIndex + 1} with Markdown: ${sendError.message}`, 'WARN', 'yellow');
+                log(`Failed to send media group chunk ${chunkIndex + 1} with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow', userId);
                 try {
                     await ctx.replyWithMediaGroup(chunk);
                 } catch (sendError2) {
-                    log(`Failed to send media group chunk ${chunkIndex + 1}, trying individual: ${sendError2.message}`, 'WARN', 'yellow');
+                    log(`Failed to send media group chunk ${chunkIndex + 1}, trying individual images: ${sendError2.message}`, 'WARN', 'yellow', userId);
                     
-                    // Send individually
                     const individualPromises = chunk.map(async (item, itemIndex) => {
                         try {
                             await ctx.replyWithPhoto(item.media, {
@@ -753,7 +897,7 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1')
                                 parse_mode: item.caption ? "Markdown" : undefined
                             });
                         } catch (individualError) {
-                            logError(individualError, `send individual image from chunk ${chunkIndex + 1}, item ${itemIndex + 1}`);
+                            logError(individualError, `send individual image from chunk ${chunkIndex + 1}, item ${itemIndex + 1}`, userId);
                         }
                     });
                     
@@ -764,38 +908,37 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1')
         
         await Promise.allSettled(sendPromises);
         
-        // Status messages
-        if (failedImages.length > 0) {
-            await ctx.reply(`⚠️ ${failedImages.length} gambar gagal diproses dari total ${images.length} gambar.`);
-        }
-        
-        log(`🌊 Image slideshow sent successfully (${successfulImages.length} images, ${totalSizeMB} MB total) using STREAMING optimization`, 'INFO', 'green');
-        return true;
-        
-    } catch (error) {
-        logError(error, 'handleImageSlideshow');
-        throw error;
-    } finally {
-        // Cleanup only temporary files (buffers are automatically garbage collected)
-        tempFiles.forEach(filename => {
+        // Cleanup files immediately
+        filenames.forEach(filename => {
             if (fs.existsSync(filename)) {
                 fs.unlink(filename, (err) => {
-                    if (err) logError(err, 'cleanup temp image file');
-                    else log(`🧹 Cleaned up temp file: ${path.basename(filename)}`, 'INFO', 'blue');
+                    if (err) logError(err, 'cleanup image file', userId);
+                    else log(`Cleaned up temporary file: ${path.basename(filename)}`, 'INFO', 'blue', userId);
                 });
             }
         });
         
-        log(`🌊 Memory cleanup completed - ${streamResults.filter(r => r.buffer).length} images were streamed without disk storage`, 'INFO', 'cyan');
+        if (failedDownloads.length > 0) {
+            await ctx.reply(`⚠️ ${failedDownloads.length} gambar gagal diunduh dari total ${images.length} gambar.`);
+        }
+        
+        log(`Image slideshow sent successfully (${successfulDownloads.length} images, ${totalSizeMB} MB total) using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
+        return true;
+        
+    } catch (error) {
+        logError(error, 'handleImageSlideshow', userId);
+        throw error;
+    } finally {
+        resourceManager.releaseUploadSlot();
     }
 }
 
-// Bot event handlers
+// Bot event handlers with concurrent processing
 bot.command("start", async (ctx) => {
     const welcomeMessage = `
-🤖 *TikTok Downloader Bot*
+🤖 *TikTok Downloader Bot - Advanced Concurrent Version*
 
-Selamat datang! Bot ini dapat mengunduh video dan gambar dari TikTok.
+Selamat datang! Bot ini dapat mengunduh video dan gambar dari TikTok dengan performa tinggi.
 
 📝 *Cara Penggunaan:*
 • Kirim link TikTok ke bot
@@ -808,313 +951,136 @@ Selamat datang! Bot ini dapat mengunduh video dan gambar dari TikTok.
 • https://vt.tiktok.com/xxx
 • https://vm.tiktok.com/xxx
 
-🌊 *STREAMING TECHNOLOGY:*
-• 🚀 **DIRECT STREAMING** - Video langsung di-stream tanpa simpan ke server!
-• 💾 **ZERO DISK USAGE** - Tidak menggunakan storage server
-• ⚡ **ULTRA FAST** - Lebih cepat karena tidak ada proses write/read file
-• 🔧 **MEMORY EFFICIENT** - Langsung dari TikTok ke Telegram
+🚀 *Fitur Advanced:*
+• **TRUE CONCURRENT PROCESSING** - Multiple users bersamaan
+• **Smart Resource Management** - Optimized for performance
+• **Connection Pooling** - Fast downloads
+• **Parallel API Calls** - v1 & v2 simultaneously
+• **No Rate Limiting** - Unlimited requests
 
-🔧 *Fitur API:*
-• API v1 dengan fallback ke v2 jika gagal
-• Retry otomatis untuk meningkatkan success rate
-
-🗑️ *Fitur Auto-Delete:*
-• Pesan link TikTok di grup akan dihapus otomatis
-• Pesan status/loading juga akan dihapus
-• Fitur ini hanya bekerja jika bot memiliki permission
-
-🚀 *Unlimited Processing:*
-• Tidak ada batasan rate limiting
-• Multiple user dapat mengirim bersamaan
-• Semua permintaan diproses secara paralel
-• Tidak ada batasan per akun Telegram
+🔧 *Performance Stats:*
+• Max Concurrent Users: ${ADVANCED_CONFIG.maxConcurrentUsers}
+• Max Concurrent Downloads: ${ADVANCED_CONFIG.maxConcurrentDownloads}
+• Max Concurrent Uploads: ${ADVANCED_CONFIG.maxConcurrentUploads}
+• Connection Pool Size: ${ADVANCED_CONFIG.connectionPoolSize}
 
 ⚡ Mulai dengan mengirim link TikTok!
     `;
     
-    await ctx.reply(welcomeMessage, { parse_mode: "Markdown" });
-    log(`New user started bot: ${ctx.from.username || ctx.from.first_name} (${ctx.from.id})`, 'INFO', 'cyan');
-});
-
-bot.command("help", async (ctx) => {
-    const helpMessage = `
-📋 *Bantuan TikTok Downloader Bot*
-
-🎯 *Fitur:*
-• Download video TikTok
-• Download slideshow gambar TikTok
-• Caption lengkap dengan info video
-• Support berbagai format link
-• Auto-delete pesan link di grup
-• Cookie support untuk download yang lebih baik
-• API v1 dengan fallback ke v2
-• 🌊 **DIRECT STREAMING TECHNOLOGY**
-
-🌊 *STREAMING FEATURES:*
-• 🚀 **Zero Disk Usage** - Video langsung di-stream dari TikTok ke Telegram
-• ⚡ **Ultra Fast Processing** - Tidak ada delay write/read file ke disk
-• 💾 **Memory Efficient** - Minimal penggunaan storage server
-• 🔄 **Intelligent Fallback** - Auto fallback ke file mode jika streaming gagal
-• 📱 **Hybrid Mode** - Gambar menggunakan buffer streaming untuk efisiensi maksimal
-
-📱 *Cara Pakai:*
-1. Copy link TikTok
-2. Kirim ke bot
-3. ⚡ Bot akan **STREAMING** konten langsung (no download ke server!)
-4. Terima file hasil streaming
-5. (Di grup) Pesan link akan dihapus otomatis
-
-🔧 *API Configuration:*
-• v1 Max Retries: ${API_CONFIG.v1MaxRetries}
-• v2 Fallback: ${API_CONFIG.retryWithV2OnV1Failure ? '✅' : '❌'}
-• v2 Max Retries: ${API_CONFIG.v2MaxRetries}
-
-🗑️ *Auto-Delete Settings:*
-• Enabled: ${AUTO_DELETE_CONFIG.enabled ? '✅' : '❌'}
-• Only in Groups: ${AUTO_DELETE_CONFIG.onlyInGroups ? '✅' : '❌'}
-• Delete Status Messages: ${AUTO_DELETE_CONFIG.deleteStatusMessages ? '✅' : '❌'}
-• Delete Delay: ${AUTO_DELETE_CONFIG.deleteDelay}ms
-
-🚀 *Performance Features:*
-• **No Rate Limiting** - Send as many links as you want!
-• **Parallel Processing** - Multiple downloads simultaneously
-• **No User Limits** - Each Telegram account has unlimited usage
-• **Instant Processing** - No delays between requests
-• 🌊 **DIRECT STREAMING** - Zero server storage usage!
-
-🌊 *Technical Advantages:*
-• **Faster Processing** - No file I/O operations
-• **Server Resource Saving** - No disk space used
-• **Better Scalability** - Handle more concurrent users
-• **Real-time Transfer** - Data flows directly from source to destination
-• **Automatic Cleanup** - No temporary files to manage
-
-❓ *Troubleshooting:*
-• Pastikan link TikTok valid
-• Bot akan otomatis coba API v2 jika v1 gagal
-• Streaming mode otomatis fallback ke file mode jika diperlukan
-• Beberapa video mungkin memiliki batasan region
-• Bot perlu permission delete_messages untuk auto-delete
-• Hubungi admin jika ada masalah
-
-📧 *Perintah:*
-/start - Mulai menggunakan bot
-/help - Tampilkan bantuan ini
-/stats - Statistik bot
-/settings - Pengaturan auto-delete
-/apiconfig - Konfigurasi API
-/streaming - Info teknologi streaming
-    `;
-    
-    await ctx.reply(helpMessage, { parse_mode: "Markdown" });
+    // Process start command asynchronously
+    setImmediate(async () => {
+        try {
+            await ctx.reply(welcomeMessage, { parse_mode: "Markdown" });
+            log(`New user started bot: ${ctx.from.username || ctx.from.first_name} (${ctx.from.id})`, 'INFO', 'cyan', ctx.from.id);
+        } catch (error) {
+            logError(error, 'start command', ctx.from.id);
+        }
+    });
 });
 
 bot.command("stats", async (ctx) => {
-    const uptime = process.uptime();
-    const uptimeString = new Date(uptime * 1000).toISOString().substr(11, 8);
-    
-    const cookieStatus = cookieString ? '🍪 Enabled' : '❌ Disabled';
-    const autoDeleteStatus = AUTO_DELETE_CONFIG.enabled ? '🗑️ Enabled' : '❌ Disabled';
-    const v2FallbackStatus = API_CONFIG.retryWithV2OnV1Failure ? '🔄 Enabled' : '❌ Disabled';
-    
-    const statsMessage = `
-📊 *Statistik Bot*
+    setImmediate(async () => {
+        try {
+            const uptime = process.uptime();
+            const uptimeString = new Date(uptime * 1000).toISOString().substr(11, 8);
+            const memUsage = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+            const activeUsers = resourceManager.getActiveUsersCount();
+            
+            const statsMessage = `
+📊 *Statistik Bot Advanced*
 
 ⏱️ *Uptime:* ${uptimeString}
-🧠 *Memory Usage:* ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB
+🧠 *Memory Usage:* ${memUsage} MB
 📈 *Node.js Version:* ${process.version}
 🤖 *Bot Status:* Online ✅
-🍪 *Cookie Support:* ${cookieStatus}
-🗑️ *Auto-Delete:* ${autoDeleteStatus}
-🔧 *v2 API Fallback:* ${v2FallbackStatus}
-🚀 *Rate Limiting:* **DISABLED** ⚡
-🔄 *Parallel Processing:* **ENABLED** 💨
+👥 *Active Users:* ${activeUsers}/${ADVANCED_CONFIG.maxConcurrentUsers}
+🍪 *Cookie Support:* ${cookieString ? '🍪 Enabled' : '❌ Disabled'}
 
-🌊 *STREAMING STATUS:*
-• Direct Video Streaming: **ACTIVE** 🚀
-• Zero Disk Usage: **ENABLED** 💾
-• Memory-based Processing: **OPTIMIZED** ⚡
-• Hybrid Image Streaming: **ACTIVE** 🖼️
-• Fallback Mode: **AVAILABLE** 🔄
-    `;
-    
-    await ctx.reply(statsMessage, { parse_mode: "Markdown" });
+🚀 *Performance Metrics:*
+• Concurrent Processing: **ENABLED** ⚡
+• Resource Management: **ACTIVE** 🔧
+• Connection Pooling: **${ADVANCED_CONFIG.connectionPoolSize} connections** 🌐
+• Download Slots: **${ADVANCED_CONFIG.maxConcurrentDownloads}** 📥
+• Upload Slots: **${ADVANCED_CONFIG.maxConcurrentUploads}** 📤
+
+📊 *Current Load:*
+• Active Users: ${activeUsers}
+• Memory Usage: ${memUsage}MB / ${Math.round(ADVANCED_CONFIG.memoryThreshold / 1024 / 1024)}MB
+• Status: ${memUsage < 512 ? '🟢 Light' : memUsage < 768 ? '🟡 Medium' : '🔴 Heavy'}
+            `;
+            
+            await ctx.reply(statsMessage, { parse_mode: "Markdown" });
+        } catch (error) {
+            logError(error, 'stats command', ctx.from.id);
+        }
+    });
 });
 
-bot.command("streaming", async (ctx) => {
-    const streamingMessage = `
-🌊 *TEKNOLOGI STREAMING*
-
-🚀 *Direct Video Streaming:*
-• Video TikTok **TIDAK** disimpan ke server disk
-• Data di-stream langsung dari TikTok → Bot → Telegram
-• Zero file I/O operations pada server
-• Menggunakan Node.js Readable Streams
-
-📱 *Cara Kerja:*
-1. Bot mengakses video URL dari TikTok API
-2. Membuat HTTP stream request ke TikTok servers
-3. Data video di-pipe langsung ke Telegram Bot API
-4. Telegram menerima stream dan mengirim ke user
-5. **TIDAK ADA FILE** yang tersimpan di server bot!
-
-🖼️ *Hybrid Image Processing:*
-• Gambar di-stream ke memory buffer
-• Buffer langsung dikirim ke Telegram
-• Fallback ke temporary file jika buffer gagal
-• Automatic cleanup untuk optimasi memory
-
-⚡ *Keunggulan Streaming:*
-• **Faster Processing** - Eliminasi write/read disk operations
-• **Zero Storage** - Server disk usage = 0 MB
-• **Better Scalability** - Handle ribuan user concurrent
-• **Memory Efficient** - Data tidak tertumpuk di disk
-• **Real-time Transfer** - Latency minimal
-
-🔧 *Technical Implementation:*
-\`\`\`javascript
-// Stream langsung tanpa file
-const stream = await downloadFile(url, null, 3, false, true);
-const inputFile = new InputFile(stream.data, 'video.mp4');
-await ctx.replyWithVideo(inputFile);
-\`\`\`
-
-📊 *Performance Comparison:*
-• Traditional: Download → Save → Read → Send → Delete
-• Streaming: **Stream → Send** ✅
-
-🔄 *Fallback System:*
-• Jika streaming gagal → Auto fallback ke file mode
-• Smart error detection dan recovery
-• Seamless user experience
-
-💡 *Environmental Benefits:*
-• Reduced server resource usage
-• Lower energy consumption
-• Minimal disk wear
-• Optimized bandwidth utilization
-
-🌊 Bot ini menggunakan **cutting-edge streaming technology** untuk performa maksimal!
-    `;
-    
-    await ctx.reply(streamingMessage, { parse_mode: "Markdown" });
-});
-
-bot.command("settings", async (ctx) => {
-    const isGroup = isGroupChat(ctx);
-    let canDelete = false;
-    
-    if (isGroup) {
-        canDelete = await canDeleteMessages(ctx);
-    }
-    
-    const settingsMessage = `
-⚙️ *Pengaturan Auto-Delete*
-
-🗑️ *Status:* ${AUTO_DELETE_CONFIG.enabled ? '✅ Aktif' : '❌ Nonaktif'}
-👥 *Hanya di Grup:* ${AUTO_DELETE_CONFIG.onlyInGroups ? '✅ Ya' : '❌ Tidak'}
-📝 *Hapus Pesan Status:* ${AUTO_DELETE_CONFIG.deleteStatusMessages ? '✅ Ya' : '❌ Tidak'}
-⏰ *Delay Hapus:* ${AUTO_DELETE_CONFIG.deleteDelay}ms
-
-📍 *Chat Saat Ini:*
-• Tipe: ${isGroup ? 'Grup' : 'Private'}
-• Bot dapat hapus pesan: ${canDelete ? '✅ Ya' : '❌ Tidak'}
-
-🚀 *Performance Settings:*
-• Rate Limiting: **DISABLED** ⚡
-• User Limits: **NONE** 🚫
-• Parallel Processing: **ENABLED** 💨
-• Max URLs per message: **UNLIMITED** ∞
-
-${!canDelete && isGroup ? '\n⚠️ *Peringatan:* Bot tidak memiliki permission untuk menghapus pesan di grup ini. Minta admin untuk memberikan permission "Delete Messages" kepada bot.' : ''}
-
-💡 *Catatan:* Pengaturan ini berlaku global untuk semua chat.
-    `;
-    
-    await ctx.reply(settingsMessage, { parse_mode: "Markdown" });
-});
-
-bot.command("apiconfig", async (ctx) => {
-    const apiConfigMessage = `
-🔧 *Konfigurasi API TikTok*
-
-📡 *API v1 Settings:*
-• Max Retries: ${API_CONFIG.v1MaxRetries}
-• Status: ${API_CONFIG.v1MaxRetries > 0 ? '✅ Aktif' : '❌ Nonaktif'}
-
-🔄 *API v2 Fallback:*
-• Enabled: ${API_CONFIG.retryWithV2OnV1Failure ? '✅ Aktif' : '❌ Nonaktif'}
-• Max Retries: ${API_CONFIG.v2MaxRetries}
-• Status: ${API_CONFIG.v2MaxRetries > 0 ? '✅ Aktif' : '❌ Nonaktif'}
-
-📈 *Strategi Download:*
-1. Coba API v1 terlebih dahulu (${API_CONFIG.v1MaxRetries}x retry)
-2. Jika v1 gagal, otomatis beralih ke v2
-3. API v2 akan dicoba hingga ${API_CONFIG.v2MaxRetries}x retry
-4. Jika keduanya gagal, tampilkan error
-
-🚀 *Performance Optimizations:*
-• **No Rate Limiting** - Process unlimited requests
-• **Parallel Processing** - Multiple downloads simultaneously  
-• **No User Restrictions** - Each user has unlimited access
-• **Instant Response** - No artificial delays
-
-💡 *Keunggulan:*
-• Meningkatkan success rate download
-• Otomatis handle API failures
-• Lebih stabil dan reliable
-• Maximum throughput untuk multiple users
-
-🔍 *Format Response v2:*
-• Video URL di: \`result.video.playAddr[0]\`
-• Support format response yang berbeda
-• Kompatibel dengan perubahan TikTok API
-    `;
-    
-    await ctx.reply(apiConfigMessage, { parse_mode: "Markdown" });
-});
-
-// Handle text messages (look for TikTok URLs) - NO RATE LIMITING
+// Handle text messages with full concurrency - NO QUEUING
 bot.on("message:text", async (ctx) => {
-    const text = ctx.message.text;
-    const urls = extractUrls(text);
-    
-    if (urls.length === 0) {
-        await ctx.reply("🔍 Kirim link TikTok untuk mengunduh video atau gambar!\n\nContoh: https://vt.tiktok.com/xxx");
-        return;
-    }
-    
-    // Process ALL URLs simultaneously - NO LIMITS
-    log(`Processing ${urls.length} URLs simultaneously from user ${ctx.from.username || ctx.from.first_name}`, 'INFO', 'cyan');
-    
-    // Process all URLs in parallel - NO RATE LIMITING
-    const processingPromises = urls.map(url => processTikTokUrl(ctx, url));
-    
-    // Wait for all to complete, but don't fail if some fail
-    const results = await Promise.allSettled(processingPromises);
-    
-    // Log results
-    const successful = results.filter(r => r.status === 'fulfilled').length;
-    const failed = results.filter(r => r.status === 'rejected').length;
-    
-    log(`Batch processing complete: ${successful} successful, ${failed} failed out of ${urls.length} URLs`, 'INFO', 'green');
-    
-    if (failed > 0 && urls.length > 1) {
-        await ctx.reply(`⚠️ ${failed} dari ${urls.length} link gagal diproses. Silakan coba link yang gagal secara individual.`);
-    }
+    // Process immediately without waiting - TRUE CONCURRENCY
+    setImmediate(async () => {
+        try {
+            const text = ctx.message.text;
+            const urls = extractUrls(text);
+            
+            if (urls.length === 0) {
+                await ctx.reply("🔍 Kirim link TikTok untuk mengunduh video atau gambar!\n\nContoh: https://vt.tiktok.com/xxx");
+                return;
+            }
+            
+            const userId = ctx.from.id;
+            log(`Processing ${urls.length} URLs simultaneously from user ${ctx.from.username || ctx.from.first_name}`, 'INFO', 'cyan', userId);
+            
+            // Process ALL URLs in TRUE PARALLEL - NO QUEUING
+            const processingPromises = urls.map(url => {
+                // Each URL gets its own execution context
+                return new Promise(async (resolve) => {
+                    try {
+                        await processTikTokUrl(ctx, url);
+                        resolve({ success: true, url });
+                    } catch (error) {
+                        logError(error, `process URL ${url}`, userId);
+                        resolve({ success: false, url, error: error.message });
+                    }
+                });
+            });
+            
+            // Execute all processing simultaneously
+            const results = await Promise.allSettled(processingPromises);
+            
+            // Log batch results
+            const successful = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+            const failed = results.filter(r => r.status === 'fulfilled' && !r.value.success).length;
+            
+            log(`Batch processing complete: ${successful} successful, ${failed} failed out of ${urls.length} URLs`, 'INFO', 'green', userId);
+            
+            if (failed > 0 && urls.length > 1) {
+                await ctx.reply(`⚠️ ${failed} dari ${urls.length} link gagal diproses. Silakan coba link yang gagal secara individual.`);
+            }
+            
+        } catch (error) {
+            logError(error, 'message handler', ctx.from?.id);
+        }
+    });
 });
 
-// Error handling
+// Enhanced error handling
 bot.catch((err) => {
     logError(err.error, 'Bot error handler');
     
     if (err.ctx && err.ctx.reply) {
-        err.ctx.reply("❌ Terjadi kesalahan internal. Silakan coba lagi.")
-            .catch(() => {}); // Ignore errors when sending error message
+        setImmediate(async () => {
+            try {
+                await err.ctx.reply("❌ Terjadi kesalahan internal. Silakan coba lagi.");
+            } catch (replyError) {
+                logError(replyError, 'Error reply failed');
+            }
+        });
     }
 });
 
-// Process monitoring
+// Process monitoring with enhanced logging
 process.on('uncaughtException', (error) => {
     logError(error, 'Uncaught Exception');
     process.exit(1);
@@ -1124,7 +1090,7 @@ process.on('unhandledRejection', (reason, promise) => {
     log(`Unhandled Rejection at: ${promise}, reason: ${reason}`, 'ERROR', 'red');
 });
 
-// Graceful shutdown
+// Graceful shutdown with resource cleanup
 process.on('SIGINT', () => {
     log('Bot stopping...', 'INFO', 'yellow');
     bot.stop();
@@ -1137,12 +1103,12 @@ process.on('SIGTERM', () => {
     process.exit(0);
 });
 
-// Start bot with cookie loading
+// Start bot with advanced configuration
 async function startBot() {
     try {
-        log('Starting TikTok Downloader Bot with STREAMING TECHNOLOGY...', 'INFO', 'blue');
+        log('Starting TikTok Downloader Bot - Advanced Concurrent Version...', 'INFO', 'blue');
         
-        // Load cookies if available
+        // Load cookies
         loadCookies();
         
         // Create temp directory
@@ -1150,47 +1116,28 @@ async function startBot() {
             fs.mkdirSync('./temp');
         }
         
+        // Start bot
         await bot.start();
-        log('✅ Bot started successfully!', 'INFO', 'green');
+        log('✅ Bot started successfully with advanced concurrency!', 'INFO', 'green');
         log(`Bot username: @${bot.botInfo.username}`, 'INFO', 'cyan');
+        
+        // Log configuration
+        log('🚀 Advanced Configuration:', 'INFO', 'magenta');
+        log(`   - Max Concurrent Users: ${ADVANCED_CONFIG.maxConcurrentUsers}`, 'INFO', 'green');
+        log(`   - Max Concurrent Downloads: ${ADVANCED_CONFIG.maxConcurrentDownloads}`, 'INFO', 'green');
+        log(`   - Max Concurrent Uploads: ${ADVANCED_CONFIG.maxConcurrentUploads}`, 'INFO', 'green');
+        log(`   - Connection Pool Size: ${ADVANCED_CONFIG.connectionPoolSize}`, 'INFO', 'green');
+        log(`   - Download Timeout: ${ADVANCED_CONFIG.downloadTimeout}ms`, 'INFO', 'blue');
+        log(`   - Upload Timeout: ${ADVANCED_CONFIG.uploadTimeout}ms`, 'INFO', 'blue');
+        log(`   - Memory Threshold: ${Math.round(ADVANCED_CONFIG.memoryThreshold / 1024 / 1024)}MB`, 'INFO', 'blue');
         
         if (cookieString) {
             log('🍪 Bot is ready with cookie support for enhanced downloads', 'INFO', 'green');
         } else {
             log('⚠️ Bot is ready without cookies (some videos might fail to download)', 'INFO', 'yellow');
-            log('💡 Tip: Create cookies.txt file for better download success rate', 'INFO', 'blue');
         }
         
-        // Log auto-delete status
-        if (AUTO_DELETE_CONFIG.enabled) {
-            log('🗑️ Auto-delete feature is enabled', 'INFO', 'green');
-            log(`   - Only in groups: ${AUTO_DELETE_CONFIG.onlyInGroups}`, 'INFO', 'blue');
-            log(`   - Delete status messages: ${AUTO_DELETE_CONFIG.deleteStatusMessages}`, 'INFO', 'blue');
-            log(`   - Delete delay: ${AUTO_DELETE_CONFIG.deleteDelay}ms`, 'INFO', 'blue');
-        } else {
-            log('⚠️ Auto-delete feature is disabled', 'INFO', 'yellow');
-        }
-        
-        // Log API configuration
-        log('🔧 API Configuration:', 'INFO', 'cyan');
-        log(`   - v1 retries: ${API_CONFIG.v1MaxRetries}`, 'INFO', 'blue');
-        log(`   - v2 fallback: ${API_CONFIG.retryWithV2OnV1Failure}`, 'INFO', 'blue');
-        log(`   - v2 retries: ${API_CONFIG.v2MaxRetries}`, 'INFO', 'blue');
-        
-        // Log performance settings
-        log('🚀 Performance Configuration:', 'INFO', 'magenta');
-        log('   - Rate Limiting: DISABLED ⚡', 'INFO', 'green');
-        log('   - User Limits: NONE 🚫', 'INFO', 'green');
-        log('   - Parallel Processing: ENABLED 💨', 'INFO', 'green');
-        log('   - Max URLs per message: UNLIMITED ∞', 'INFO', 'green');
-        
-        // Log streaming technology
-        log('🌊 Streaming Technology:', 'INFO', 'cyan');
-        log('   - Direct Video Streaming: ENABLED 🚀', 'INFO', 'green');
-        log('   - Zero Disk Usage: ACTIVE 💾', 'INFO', 'green');
-        log('   - Memory-based Processing: OPTIMIZED ⚡', 'INFO', 'green');
-        log('   - Hybrid Image Streaming: ACTIVE 🖼️', 'INFO', 'green');
-        log('   - Fallback System: AVAILABLE 🔄', 'INFO', 'green');
+        log('🔥 TRUE CONCURRENT PROCESSING ENABLED - Multiple users will be handled simultaneously!', 'INFO', 'magenta');
         
     } catch (error) {
         logError(error, 'Bot startup');
@@ -1201,4 +1148,4 @@ async function startBot() {
 // Start the bot
 startBot();
 
-module.exports = { bot, AUTO_DELETE_CONFIG, API_CONFIG };
+module.exports = { bot, resourceManager, ADVANCED_CONFIG };
