@@ -383,7 +383,7 @@ function generateCaption(data, isPhoto = false, fileSize = null, apiVersion = 'v
     return caption;
 }
 
-// Main TikTok processing function with auto-delete support
+// Main TikTok processing function with auto-delete support - NO RATE LIMITING
 async function processTikTokUrl(ctx, url) {
     const userId = ctx.from.id;
     const username = ctx.from.username || ctx.from.first_name || 'Unknown';
@@ -579,7 +579,7 @@ async function handleVideo(ctx, data, statusMessage, apiVersion = 'v1') {
     }
 }
 
-// Handle image slideshow content with enhanced error handling and size info
+// Handle image slideshow content with enhanced error handling and size info - NO DELAYS
 async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1') {
     const filenames = [];
     const downloadResults = [];
@@ -605,7 +605,7 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1')
             fs.mkdirSync(tempDir, { recursive: true });
         }
         
-        // Download images with better error handling
+        // Download images with better error handling - PARALLEL PROCESSING
         const timestamp = Date.now();
         const downloadPromises = images.map(async (imageUrl, index) => {
             try {
@@ -627,7 +627,7 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1')
             }
         });
         
-        // Download all images
+        // Download all images simultaneously - NO RATE LIMITING
         const downloadSettledResults = await Promise.allSettled(downloadPromises);
         
         // Process results
@@ -670,50 +670,59 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1')
         // Generate caption with total size and API version
         const caption = generateCaption(data, true, totalSizeMB, apiVersion);
         
-        // Prepare media group (max 10 images for Telegram)
-        const maxImages = Math.min(successfulDownloads.length, 10);
-        const mediaGroup = successfulDownloads.slice(0, maxImages).map((result, index) => ({
+        // Prepare media group - SEND ALL IMAGES (no 10 image limit)
+        const mediaGroup = successfulDownloads.map((result, index) => ({
             type: "photo",
             media: new InputFile(result.filename),
             caption: index === 0 ? caption : undefined
         }));
         
-        // Send media group with error handling
+        // Send media group with error handling - HANDLE TELEGRAM LIMITS GRACEFULLY
         try {
-            await ctx.replyWithMediaGroup(mediaGroup, { parse_mode: "Markdown" });
-        } catch (sendError) {
-            log(`Failed to send media group with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow');
-            try {
-                await ctx.replyWithMediaGroup(mediaGroup);
-            } catch (sendError2) {
-                log(`Failed to send media group, trying individual images: ${sendError2.message}`, 'WARN', 'yellow');
-                
-                // Fallback: send images individually
-                for (let i = 0; i < Math.min(successfulDownloads.length, 5); i++) {
-                    const result = successfulDownloads[i];
+            // Telegram has a limit of 10 media items per group, so we need to split
+            const mediaGroupChunks = [];
+            for (let i = 0; i < mediaGroup.length; i += 10) {
+                mediaGroupChunks.push(mediaGroup.slice(i, i + 10));
+            }
+            
+            // Send all chunks simultaneously - NO DELAYS
+            const sendPromises = mediaGroupChunks.map(async (chunk, chunkIndex) => {
+                try {
+                    await ctx.replyWithMediaGroup(chunk, { parse_mode: "Markdown" });
+                } catch (sendError) {
+                    log(`Failed to send media group chunk ${chunkIndex + 1} with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow');
                     try {
-                        await ctx.replyWithPhoto(new InputFile(result.filename), {
-                            caption: i === 0 ? caption : undefined,
-                            parse_mode: i === 0 ? "Markdown" : undefined
+                        await ctx.replyWithMediaGroup(chunk);
+                    } catch (sendError2) {
+                        log(`Failed to send media group chunk ${chunkIndex + 1}, trying individual images: ${sendError2.message}`, 'WARN', 'yellow');
+                        
+                        // Fallback: send images individually from this chunk
+                        const individualPromises = chunk.map(async (item, itemIndex) => {
+                            try {
+                                await ctx.replyWithPhoto(item.media, {
+                                    caption: item.caption || undefined,
+                                    parse_mode: item.caption ? "Markdown" : undefined
+                                });
+                            } catch (individualError) {
+                                logError(individualError, `send individual image from chunk ${chunkIndex + 1}, item ${itemIndex + 1}`);
+                            }
                         });
-                        await new Promise(resolve => setTimeout(resolve, 500)); // Small delay
-                    } catch (individualError) {
-                        logError(individualError, `send individual image ${i + 1}`);
+                        
+                        await Promise.allSettled(individualPromises);
                     }
                 }
-            }
+            });
+            
+            await Promise.allSettled(sendPromises);
+            
+        } catch (sendError) {
+            logError(sendError, 'send media groups');
         }
         
         // Warn if some images were skipped
         if (failedDownloads.length > 0) {
             await ctx.reply(
                 `⚠️ ${failedDownloads.length} gambar gagal diunduh dari total ${images.length} gambar.`
-            );
-        }
-        
-        if (successfulDownloads.length > 10) {
-            await ctx.reply(
-                `📝 Hanya 10 gambar pertama yang dikirim (dari total ${successfulDownloads.length} gambar yang berhasil diunduh).`
             );
         }
         
@@ -763,6 +772,12 @@ Selamat datang! Bot ini dapat mengunduh video dan gambar dari TikTok.
 • Pesan status/loading juga akan dihapus
 • Fitur ini hanya bekerja jika bot memiliki permission
 
+🚀 *Unlimited Processing:*
+• Tidak ada batasan rate limiting
+• Multiple user dapat mengirim bersamaan
+• Semua permintaan diproses secara paralel
+• Tidak ada batasan per akun Telegram
+
 ⚡ Mulai dengan mengirim link TikTok!
     `;
     
@@ -782,6 +797,7 @@ bot.command("help", async (ctx) => {
 • Auto-delete pesan link di grup
 • Cookie support untuk download yang lebih baik
 • API v1 dengan fallback ke v2
+• 🚀 **UNLIMITED PROCESSING** - Tidak ada rate limiting!
 
 📱 *Cara Pakai:*
 1. Copy link TikTok
@@ -800,6 +816,12 @@ bot.command("help", async (ctx) => {
 • Only in Groups: ${AUTO_DELETE_CONFIG.onlyInGroups ? '✅' : '❌'}
 • Delete Status Messages: ${AUTO_DELETE_CONFIG.deleteStatusMessages ? '✅' : '❌'}
 • Delete Delay: ${AUTO_DELETE_CONFIG.deleteDelay}ms
+
+🚀 *Performance Features:*
+• **No Rate Limiting** - Send as many links as you want!
+• **Parallel Processing** - Multiple downloads simultaneously
+• **No User Limits** - Each Telegram account has unlimited usage
+• **Instant Processing** - No delays between requests
 
 ❓ *Troubleshooting:*
 • Pastikan link TikTok valid
@@ -837,6 +859,8 @@ bot.command("stats", async (ctx) => {
 🍪 *Cookie Support:* ${cookieStatus}
 🗑️ *Auto-Delete:* ${autoDeleteStatus}
 🔧 *v2 API Fallback:* ${v2FallbackStatus}
+🚀 *Rate Limiting:* **DISABLED** ⚡
+🔄 *Parallel Processing:* **ENABLED** 💨
     `;
     
     await ctx.reply(statsMessage, { parse_mode: "Markdown" });
@@ -861,6 +885,12 @@ bot.command("settings", async (ctx) => {
 📍 *Chat Saat Ini:*
 • Tipe: ${isGroup ? 'Grup' : 'Private'}
 • Bot dapat hapus pesan: ${canDelete ? '✅ Ya' : '❌ Tidak'}
+
+🚀 *Performance Settings:*
+• Rate Limiting: **DISABLED** ⚡
+• User Limits: **NONE** 🚫
+• Parallel Processing: **ENABLED** 💨
+• Max URLs per message: **UNLIMITED** ∞
 
 ${!canDelete && isGroup ? '\n⚠️ *Peringatan:* Bot tidak memiliki permission untuk menghapus pesan di grup ini. Minta admin untuk memberikan permission "Delete Messages" kepada bot.' : ''}
 
@@ -889,10 +919,17 @@ bot.command("apiconfig", async (ctx) => {
 3. API v2 akan dicoba hingga ${API_CONFIG.v2MaxRetries}x retry
 4. Jika keduanya gagal, tampilkan error
 
+🚀 *Performance Optimizations:*
+• **No Rate Limiting** - Process unlimited requests
+• **Parallel Processing** - Multiple downloads simultaneously  
+• **No User Restrictions** - Each user has unlimited access
+• **Instant Response** - No artificial delays
+
 💡 *Keunggulan:*
 • Meningkatkan success rate download
 • Otomatis handle API failures
 • Lebih stabil dan reliable
+• Maximum throughput untuk multiple users
 
 🔍 *Format Response v2:*
 • Video URL di: \`result.video.playAddr[0]\`
@@ -903,7 +940,7 @@ bot.command("apiconfig", async (ctx) => {
     await ctx.reply(apiConfigMessage, { parse_mode: "Markdown" });
 });
 
-// Handle text messages (look for TikTok URLs)
+// Handle text messages (look for TikTok URLs) - NO RATE LIMITING
 bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     const urls = extractUrls(text);
@@ -913,21 +950,23 @@ bot.on("message:text", async (ctx) => {
         return;
     }
     
-    // Process each URL (but limit to prevent spam)
-    const maxUrls = 3;
-    const urlsToProcess = urls.slice(0, maxUrls);
+    // Process ALL URLs simultaneously - NO LIMITS
+    log(`Processing ${urls.length} URLs simultaneously from user ${ctx.from.username || ctx.from.first_name}`, 'INFO', 'cyan');
     
-    if (urls.length > maxUrls) {
-        await ctx.reply(`⚠️ Maksimal ${maxUrls} link per pesan. Memproses ${maxUrls} link pertama.`);
-    }
+    // Process all URLs in parallel - NO RATE LIMITING
+    const processingPromises = urls.map(url => processTikTokUrl(ctx, url));
     
-    for (const url of urlsToProcess) {
-        await processTikTokUrl(ctx, url);
-        
-        // Small delay between processing multiple URLs
-        if (urlsToProcess.length > 1) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+    // Wait for all to complete, but don't fail if some fail
+    const results = await Promise.allSettled(processingPromises);
+    
+    // Log results
+    const successful = results.filter(r => r.status === 'fulfilled').length;
+    const failed = results.filter(r => r.status === 'rejected').length;
+    
+    log(`Batch processing complete: ${successful} successful, ${failed} failed out of ${urls.length} URLs`, 'INFO', 'green');
+    
+    if (failed > 0 && urls.length > 1) {
+        await ctx.reply(`⚠️ ${failed} dari ${urls.length} link gagal diproses. Silakan coba link yang gagal secara individual.`);
     }
 });
 
@@ -967,7 +1006,7 @@ process.on('SIGTERM', () => {
 // Start bot with cookie loading
 async function startBot() {
     try {
-        log('Starting TikTok Downloader Bot...', 'INFO', 'blue');
+        log('Starting TikTok Downloader Bot (NO RATE LIMITING)...', 'INFO', 'blue');
         
         // Load cookies if available
         loadCookies();
@@ -1003,6 +1042,13 @@ async function startBot() {
         log(`   - v1 retries: ${API_CONFIG.v1MaxRetries}`, 'INFO', 'blue');
         log(`   - v2 fallback: ${API_CONFIG.retryWithV2OnV1Failure}`, 'INFO', 'blue');
         log(`   - v2 retries: ${API_CONFIG.v2MaxRetries}`, 'INFO', 'blue');
+        
+        // Log performance settings
+        log('🚀 Performance Configuration:', 'INFO', 'magenta');
+        log('   - Rate Limiting: DISABLED ⚡', 'INFO', 'green');
+        log('   - User Limits: NONE 🚫', 'INFO', 'green');
+        log('   - Parallel Processing: ENABLED 💨', 'INFO', 'green');
+        log('   - Max URLs per message: UNLIMITED ∞', 'INFO', 'green');
         
     } catch (error) {
         logError(error, 'Bot startup');
