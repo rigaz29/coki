@@ -31,8 +31,8 @@ const AUTO_DELETE_CONFIG = {
 // API version configuration
 const API_CONFIG = {
     retryWithV2OnV1Failure: true, // Enable v2 fallback
-    v1MaxRetries: 2, // Max retries for v1 before switching to v2
-    v2MaxRetries: 3  // Max retries for v2
+    v1MaxRetries: 1, // Max retries for v1 before switching to v2
+    v2MaxRetries: 2  // Max retries for v2
 };
 
 // Logging colors
