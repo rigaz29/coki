@@ -533,7 +533,11 @@ function extractUrls(text) {
     return urls.filter(url => isValidTikTokUrl(url));
 }
 
-// Generate enhanced caption
+// Escape Markdown special characters
+function escapeMarkdown(text) {
+    if (!text || typeof text !== 'string') return '';
+    return text
+        .replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\// Generate enhanced caption
 function generateCaption(data, isPhoto = false, fileSize = null, apiVersion = 'v1') {
     const createTime = formatTimestamp(data.createTime || data.create_time);
     const uid = data.author?.uid || data.author?.id || 'Unknown';
@@ -560,6 +564,77 @@ function generateCaption(data, isPhoto = false, fileSize = null, apiVersion = 'v
     }
     
     return caption;
+}')
+        .replace(/\n/g, '\n'); // Keep newlines
+}
+
+// Safe URL validation and formatting
+function formatSafeUrl(url, text) {
+    if (!url || !text) return text || '';
+    
+    try {
+        // Basic URL validation
+        new URL(url);
+        // Escape special characters in link text
+        const safeText = escapeMarkdown(text);
+        return `[${safeText}](${url})`;
+    } catch (error) {
+        // If URL is invalid, return plain text
+        return escapeMarkdown(text);
+    }
+}
+
+// Generate enhanced caption with safe Markdown formatting
+function generateCaption(data, isPhoto = false, fileSize = null, apiVersion = 'v1') {
+    try {
+        const createTime = formatTimestamp(data.createTime || data.create_time);
+        const uid = data.author?.uid || data.author?.id || 'Unknown';
+        const username = data.author?.uniqueId || data.author?.username || data.author?.nickname || 'Unknown';
+        const videoId = data.id || data.aweme_id || 'Unknown';
+        
+        // Get original TikTok URL with validation
+        const originalUrl = data.url || data.webVideoUrl || `https://www.tiktok.com/@${username}/${isPhoto ? 'photo' : 'video'}/${videoId}`;
+        
+        // Build caption with escaped content
+        let caption = `📅 ${escapeMarkdown(createTime)}\n`;
+        caption += `👤 UID: ${escapeMarkdown(uid.toString())}\n`;
+        
+        // Create safe hyperlink for username
+        caption += `👤 Username: ${formatSafeUrl(originalUrl, username)}\n`;
+        
+        // Add file size if provided
+        if (fileSize) {
+            caption += `📁 Size: ${escapeMarkdown(fileSize.toString())} MB\n`;
+        }
+        
+        // Add API version info
+        caption += `🔧 API: ${escapeMarkdown(apiVersion.toUpperCase())}\n`;
+        
+        // Add TikTok link
+        caption += `🔗 ${formatSafeUrl(originalUrl, 'Link TikTok')}`;
+        
+        // Add description if available with safe formatting
+        const description = data.desc || data.description || '';
+        if (description && description.trim()) {
+            const cleanDesc = description.trim().substring(0, 300);
+            const safeDesc = escapeMarkdown(cleanDesc);
+            const ellipsis = description.length > 300 ? '\\.\\.\\.' : '';
+            caption += `\n\n📝 "${safeDesc}${ellipsis}"`;
+        }
+        
+        return caption;
+        
+    } catch (error) {
+        logError(error, 'generateCaption');
+        
+        // Fallback: return simple caption without Markdown
+        const fallbackCaption = `📅 ${formatTimestamp(data.createTime || data.create_time)}
+👤 ${data.author?.uniqueId || 'Unknown'}
+🔧 API: ${apiVersion.toUpperCase()}
+🔗 TikTok Content`;
+        
+        return fallbackCaption;
+    }
 }
 
 // Main TikTok processing function with advanced concurrency
@@ -699,42 +774,83 @@ async function handleVideo(ctx, data, statusMessage, apiVersion = 'v1', userId) 
         // Generate caption
         const caption = generateCaption(data, false, downloadResult.sizeMB, apiVersion);
         
-        // Send video with timeout
-        const uploadPromise = ctx.replyWithVideo(new InputFile(filename), {
-            caption: caption,
-            supports_streaming: true,
-            parse_mode: "Markdown"
-        });
+        // Send video with enhanced error handling and multiple fallbacks
+        const uploadPromise = async () => {
+            try {
+                // Try with Markdown first
+                await ctx.replyWithVideo(new InputFile(filename), {
+                    caption: caption,
+                    supports_streaming: true,
+                    parse_mode: "Markdown"
+                });
+                return { success: true, method: 'markdown' };
+            } catch (markdownError) {
+                log(`Failed to send with Markdown: ${markdownError.message}`, 'WARN', 'yellow', userId);
+                
+                try {
+                    // Try with HTML parse mode
+                    const htmlCaption = caption
+                        .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                        .replace(/\*(.*?)\*/g, '<i>$1</i>')
+                        .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>')
+                        .replace(/\\(.)/g, '$1'); // Remove escape characters
+                    
+                    await ctx.replyWithVideo(new InputFile(filename), {
+                        caption: htmlCaption,
+                        supports_streaming: true,
+                        parse_mode: "HTML"
+                    });
+                    return { success: true, method: 'html' };
+                } catch (htmlError) {
+                    log(`Failed to send with HTML: ${htmlError.message}`, 'WARN', 'yellow', userId);
+                    
+                    try {
+                        // Try without parse mode (plain text)
+                        const plainCaption = caption
+                            .replace(/\[(.*?)\]\((.*?)\)/g, '$1: $2') // Convert links to plain text
+                            .replace(/\\(.)/g, '$1') // Remove escape characters
+                            .replace(/\*\*(.*?)\*\*/g, '$1') // Remove bold
+                            .replace(/\*(.*?)\*/g, '$1'); // Remove italic
+                        
+                        await ctx.replyWithVideo(new InputFile(filename), {
+                            caption: plainCaption,
+                            supports_streaming: true
+                        });
+                        return { success: true, method: 'plain' };
+                    } catch (plainError) {
+                        log(`Failed to send with caption: ${plainError.message}`, 'WARN', 'yellow', userId);
+                        
+                        try {
+                            // Send video without caption
+                            await ctx.replyWithVideo(new InputFile(filename), {
+                                supports_streaming: true
+                            });
+                            
+                            // Send caption separately as plain text
+                            const fallbackCaption = `📅 ${formatTimestamp(data.createTime || data.create_time)}
+👤 ${data.author?.uniqueId || 'Unknown'}  
+🔧 API: ${apiVersion.toUpperCase()}
+🔗 ${data.url || data.webVideoUrl || 'TikTok Content'}`;
+                            
+                            await ctx.reply(fallbackCaption);
+                            return { success: true, method: 'separate' };
+                        } catch (separateError) {
+                            log(`Failed to send video completely: ${separateError.message}`, 'ERROR', 'red', userId);
+                            throw separateError;
+                        }
+                    }
+                }
+            }
+        };
         
         const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => reject(new Error('Upload timeout')), ADVANCED_CONFIG.uploadTimeout);
         });
         
-        try {
-            await Promise.race([uploadPromise, timeoutPromise]);
-        } catch (sendError) {
-            log(`Failed to send with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow', userId);
-            try {
-                await Promise.race([
-                    ctx.replyWithVideo(new InputFile(filename), {
-                        caption: caption,
-                        supports_streaming: true
-                    }),
-                    timeoutPromise
-                ]);
-            } catch (sendError2) {
-                log(`Failed to send with caption, trying without: ${sendError2.message}`, 'WARN', 'yellow', userId);
-                await Promise.race([
-                    ctx.replyWithVideo(new InputFile(filename), {
-                        supports_streaming: true
-                    }),
-                    timeoutPromise
-                ]);
-                await ctx.reply(caption, { parse_mode: "Markdown" });
-            }
-        }
+        const result = await Promise.race([uploadPromise(), timeoutPromise]);
+        log(`Video sent successfully using ${result.method} format`, 'INFO', 'green', userId);
         
-        log(`Video sent successfully using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
+        log(`Video sent successfully using ${apiVersion.toUpperCase()} API with ${result.method} format`, 'INFO', 'green', userId);
         
         // Cleanup file immediately after successful upload
         if (filename && fs.existsSync(filename)) {
@@ -854,7 +970,7 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1',
         // Generate caption
         const caption = generateCaption(data, true, totalSizeMB, apiVersion);
         
-        // Send images in chunks of 10 (Telegram limit) concurrently
+        // Send images in chunks of 10 (Telegram limit) with enhanced error handling
         const mediaGroupChunks = [];
         for (let i = 0; i < successfulDownloads.length; i += 10) {
             const chunk = successfulDownloads.slice(i, i + 10).map((result, index) => ({
@@ -865,29 +981,72 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1',
             mediaGroupChunks.push(chunk);
         }
         
-        // Send all chunks concurrently
+        // Send all chunks with multiple fallback strategies
         const sendPromises = mediaGroupChunks.map(async (chunk, chunkIndex) => {
             try {
+                // Try with Markdown first
                 await ctx.replyWithMediaGroup(chunk, { parse_mode: "Markdown" });
-            } catch (sendError) {
-                log(`Failed to send media group chunk ${chunkIndex + 1} with Markdown, trying without: ${sendError.message}`, 'WARN', 'yellow', userId);
+                log(`Media group chunk ${chunkIndex + 1} sent with Markdown`, 'INFO', 'green', userId);
+            } catch (markdownError) {
+                log(`Failed to send media group chunk ${chunkIndex + 1} with Markdown: ${markdownError.message}`, 'WARN', 'yellow', userId);
+                
                 try {
-                    await ctx.replyWithMediaGroup(chunk);
-                } catch (sendError2) {
-                    log(`Failed to send media group chunk ${chunkIndex + 1}, trying individual images: ${sendError2.message}`, 'WARN', 'yellow', userId);
+                    // Try with HTML parse mode
+                    const htmlChunk = chunk.map(item => ({
+                        ...item,
+                        caption: item.caption ? item.caption
+                            .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>')
+                            .replace(/\*(.*?)\*/g, '<i>$1</i>')
+                            .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>')
+                            .replace(/\\(.)/g, '$1') : undefined
+                    }));
                     
-                    const individualPromises = chunk.map(async (item, itemIndex) => {
+                    await ctx.replyWithMediaGroup(htmlChunk, { parse_mode: "HTML" });
+                    log(`Media group chunk ${chunkIndex + 1} sent with HTML`, 'INFO', 'green', userId);
+                } catch (htmlError) {
+                    log(`Failed to send media group chunk ${chunkIndex + 1} with HTML: ${htmlError.message}`, 'WARN', 'yellow', userId);
+                    
+                    try {
+                        // Try without parse mode (plain text)
+                        const plainChunk = chunk.map(item => ({
+                            ...item,
+                            caption: item.caption ? item.caption
+                                .replace(/\[(.*?)\]\((.*?)\)/g, '$1: $2')
+                                .replace(/\\(.)/g, '$1')
+                                .replace(/\*\*(.*?)\*\*/g, '$1')
+                                .replace(/\*(.*?)\*/g, '$1') : undefined
+                        }));
+                        
+                        await ctx.replyWithMediaGroup(plainChunk);
+                        log(`Media group chunk ${chunkIndex + 1} sent with plain text`, 'INFO', 'green', userId);
+                    } catch (plainError) {
+                        log(`Failed to send media group chunk ${chunkIndex + 1} with plain text: ${plainError.message}`, 'WARN', 'yellow', userId);
+                        
                         try {
-                            await ctx.replyWithPhoto(item.media, {
-                                caption: item.caption || undefined,
-                                parse_mode: item.caption ? "Markdown" : undefined
+                            // Fallback: send images individually without captions
+                            const individualPromises = chunk.map(async (item, itemIndex) => {
+                                try {
+                                    await ctx.replyWithPhoto(item.media);
+                                    
+                                    // Send caption separately only for first image
+                                    if (chunkIndex === 0 && itemIndex === 0 && item.caption) {
+                                        const fallbackCaption = `📅 ${formatTimestamp(data.createTime || data.create_time)}
+👤 ${data.author?.uniqueId || 'Unknown'}
+🔧 API: ${apiVersion.toUpperCase()}
+🔗 ${data.url || data.webVideoUrl || 'TikTok Content'}`;
+                                        await ctx.reply(fallbackCaption);
+                                    }
+                                } catch (individualError) {
+                                    logError(individualError, `send individual image from chunk ${chunkIndex + 1}, item ${itemIndex + 1}`, userId);
+                                }
                             });
+                            
+                            await Promise.allSettled(individualPromises);
+                            log(`Media group chunk ${chunkIndex + 1} sent individually`, 'INFO', 'green', userId);
                         } catch (individualError) {
-                            logError(individualError, `send individual image from chunk ${chunkIndex + 1}, item ${itemIndex + 1}`, userId);
+                            logError(individualError, `send individual images from chunk ${chunkIndex + 1}`, userId);
                         }
-                    });
-                    
-                    await Promise.allSettled(individualPromises);
+                    }
                 }
             }
         });
@@ -908,7 +1067,7 @@ async function handleImageSlideshow(ctx, data, statusMessage, apiVersion = 'v1',
             await ctx.reply(`⚠️ ${failedDownloads.length} gambar gagal diunduh dari total ${images.length} gambar.`);
         }
         
-        log(`Image slideshow sent successfully (${successfulDownloads.length} images, ${totalSizeMB} MB total) using ${apiVersion.toUpperCase()} API`, 'INFO', 'green', userId);
+        log(`Image slideshow sent successfully (${successfulDownloads.length} images, ${totalSizeMB} MB total) using ${apiVersion.toUpperCase()} API with enhanced fallbacks`, 'INFO', 'green', userId);
         return true;
         
     } catch (error) {
