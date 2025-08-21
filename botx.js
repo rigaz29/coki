@@ -300,88 +300,74 @@ function getAxiosConfig(useCookies = false) {
     return config;
 }
 
-// Enhanced TikTok data fetching with concurrent API calls
+// Enhanced TikTok data fetching with v1 priority, v2 fallback
 async function fetchTikTokData(url, userId) {
     let lastError = null;
     
-    // Create promises for both API versions to run concurrently
-    const apiPromises = [];
-    
-    // Add v1 API promise
+    // Try v1 API first with priority
     if (API_CONFIG.v1MaxRetries > 0) {
-        apiPromises.push(
-            (async () => {
-                for (let attempt = 1; attempt <= API_CONFIG.v1MaxRetries; attempt++) {
-                    try {
-                        log(`Attempting v1 API (attempt ${attempt}/${API_CONFIG.v1MaxRetries}): ${url}`, 'INFO', 'blue', userId);
-                        
-                        const result = await Tiktok.Downloader(url, { version: "v1" });
-                        
-                        if (result && result.status === "success" && result.result) {
-                            log('✅ v1 API successful', 'INFO', 'green', userId);
-                            return { ...result, apiVersion: 'v1' };
-                        } else {
-                            throw new Error(result?.message || "v1 API returned unsuccessful status");
-                        }
-                        
-                    } catch (error) {
-                        lastError = error;
-                        log(`v1 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
-                        
-                        if (attempt < API_CONFIG.v1MaxRetries) {
-                            const delay = Math.min(Math.pow(2, attempt) * 1000, 5000); // Max 5s delay
-                            await new Promise(resolve => setTimeout(resolve, delay));
-                        }
-                    }
-                }
-                throw lastError;
-            })()
-        );
-    }
-    
-    // Add v2 API promise if fallback is enabled
-    if (API_CONFIG.retryWithV2OnV1Failure && API_CONFIG.v2MaxRetries > 0) {
-        apiPromises.push(
-            (async () => {
-                // Wait a bit before trying v2 to give v1 a chance
-                await new Promise(resolve => setTimeout(resolve, 1000));
+        for (let attempt = 1; attempt <= API_CONFIG.v1MaxRetries; attempt++) {
+            try {
+                log(`Attempting v1 API (attempt ${attempt}/${API_CONFIG.v1MaxRetries}): ${url}`, 'INFO', 'blue', userId);
                 
-                for (let attempt = 1; attempt <= API_CONFIG.v2MaxRetries; attempt++) {
-                    try {
-                        log(`Attempting v2 API (attempt ${attempt}/${API_CONFIG.v2MaxRetries}): ${url}`, 'INFO', 'blue', userId);
-                        
-                        const result = await Tiktok.Downloader(url, { version: "v2" });
-                        
-                        if (result && result.status === "success" && result.result) {
-                            log('✅ v2 API successful', 'INFO', 'green', userId);
-                            return { ...result, apiVersion: 'v2' };
-                        } else {
-                            throw new Error(result?.message || "v2 API returned unsuccessful status");
-                        }
-                        
-                    } catch (error) {
-                        lastError = error;
-                        log(`v2 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
-                        
-                        if (attempt < API_CONFIG.v2MaxRetries) {
-                            const delay = Math.min(Math.pow(2, attempt) * 1000, 5000);
-                            await new Promise(resolve => setTimeout(resolve, delay));
-                        }
-                    }
+                const result = await Tiktok.Downloader(url, { version: "v1" });
+                
+                if (result && result.status === "success" && result.result) {
+                    log('✅ v1 API successful', 'INFO', 'green', userId);
+                    return { ...result, apiVersion: 'v1' };
+                } else {
+                    throw new Error(result?.message || "v1 API returned unsuccessful status");
                 }
-                throw lastError;
-            })()
-        );
+                
+            } catch (error) {
+                lastError = error;
+                log(`v1 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
+                
+                if (attempt < API_CONFIG.v1MaxRetries) {
+                    const delay = Math.min(Math.pow(2, attempt) * 1000, 5000); // Max 5s delay
+                    log(`Retrying v1 in ${delay}ms...`, 'INFO', 'yellow', userId);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        log('❌ v1 API failed after all retries', 'WARN', 'yellow', userId);
     }
     
-    // Race the API calls - return first successful result
-    try {
-        const result = await Promise.any(apiPromises);
-        return result;
-    } catch (error) {
-        // All APIs failed
-        throw new Error(`Both v1 and v2 APIs failed. Last error: ${lastError?.message || 'Unknown error'}`);
+    // Try v2 API as fallback only if v1 failed
+    if (API_CONFIG.retryWithV2OnV1Failure && API_CONFIG.v2MaxRetries > 0) {
+        log('🔄 v1 API failed, switching to v2 API as fallback...', 'INFO', 'cyan', userId);
+        
+        for (let attempt = 1; attempt <= API_CONFIG.v2MaxRetries; attempt++) {
+            try {
+                log(`Attempting v2 API (attempt ${attempt}/${API_CONFIG.v2MaxRetries}): ${url}`, 'INFO', 'blue', userId);
+                
+                const result = await Tiktok.Downloader(url, { version: "v2" });
+                
+                if (result && result.status === "success" && result.result) {
+                    log('✅ v2 API successful', 'INFO', 'green', userId);
+                    return { ...result, apiVersion: 'v2' };
+                } else {
+                    throw new Error(result?.message || "v2 API returned unsuccessful status");
+                }
+                
+            } catch (error) {
+                lastError = error;
+                log(`v2 API attempt ${attempt} failed: ${error.message}`, 'WARN', 'yellow', userId);
+                
+                if (attempt < API_CONFIG.v2MaxRetries) {
+                    const delay = Math.min(Math.pow(2, attempt) * 1000, 5000);
+                    log(`Retrying v2 in ${delay}ms...`, 'INFO', 'yellow', userId);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        log('❌ v2 API failed after all retries', 'WARN', 'yellow', userId);
     }
+    
+    // Both APIs failed
+    throw new Error(`Both v1 and v2 APIs failed. Last error: ${lastError?.message || 'Unknown error'}`);
 }
 
 // Enhanced download function with semaphore and streaming optimization
@@ -1137,7 +1123,7 @@ async function startBot() {
             log('⚠️ Bot is ready without cookies (some videos might fail to download)', 'INFO', 'yellow');
         }
         
-        log('🔥 TRUE CONCURRENT PROCESSING ENABLED - Multiple users will be handled simultaneously!', 'INFO', 'magenta');
+        log('🔥 TRUE CONCURRENT PROCESSING + v1 PRIORITY ENABLED - Multiple users handled simultaneously with smart API selection!', 'INFO', 'magenta');
         
     } catch (error) {
         logError(error, 'Bot startup');
